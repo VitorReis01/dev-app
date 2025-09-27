@@ -1,0 +1,36 @@
+{
+  "name": "desktop-agent",
+  "version": "1.0.0",
+  "description": "Agente desktop para monitoramento e suporte remoto",
+  "author": "Sua Empresa <email@suaempresa.com>",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "build": {
+    "appId": "com.suaempresa.desktopagent",
+    "productName": "Desktop Agent",
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "package.json",
+      "node_modules/*/"
+    ],
+    "directories": {
+      "buildResources": "assets",
+      "output": "dist"
+    },
+    "win": {
+      "target": "nsis"
+    }
+  },
+  "dependencies": {
+    "ws": "^8.14.2"
+  },
+  "devDependencies": {
+    "electron": "^25.0.0",
+    "electron-builder": "^26.0.12"
+  }
+}

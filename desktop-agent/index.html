@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <title>Desktop Agent</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 20px;
+      background: #f5f5f5;
+    }
+    h2 {
+      margin-bottom: 10px;
+    }
+    #status {
+      margin: 10px 0;
+      padding: 10px;
+      background: #eee;
+      border-radius: 5px;
+    }
+    button {
+      margin: 5px;
+      padding: 8px 15px;
+      font-size: 14px;
+      cursor: pointer;
+      border: none;
+      border-radius: 4px;
+    }
+    button.accept { background: #4CAF50; color: white; }
+    button.deny { background: #f44336; color: white; }
+    video {
+      width: 100%;
+      height: auto;
+      margin-top: 15px;
+      border: 2px solid #333;
+      border-radius: 5px;
+    }
+  </style>
+</head>
+<body>
+  <h2>Desktop Agent</h2>
+  <div id="status">🔌 Aguardando conexão...</div>
+  <div id="controls"></div>
+
+  <script>
+    // Quando admin pede acesso
+    window.electronAPI.onConsentRequest((admin) => {
+      document.getElementById("status").innerText = 
+        `⚠️ O administrador ${admin} solicitou acesso à sua tela.`;
+
+      document.getElementById("controls").innerHTML = `
+        <button class="accept" id="accept">Aceitar</button>
+        <button class="deny" id="deny">Negar</button>
+      `;
+
+      document.getElementById("accept").addEventListener("click", () => {
+        window.electronAPI.sendConsentResponse(true);
+      });
+
+      document.getElementById("deny").addEventListener("click", () => {
+        window.electronAPI.sendConsentResponse(false);
+      });
+    });
+
+    // Quando admin conecta
+    window.electronAPI.onAdminConnected((admin) => {
+      document.getElementById("status").innerText = 
+        `✅ O administrador ${admin} está online.`;
+    });
+
+    // Quando usuário aceitou → começa a captura de tela
+    window.electronAPI.onStartScreenShare(async () => {
+      try {
+        const stream = await window.electronAPI.getScreenStream();
+        const video = document.createElement("video");
+        video.srcObject = stream;
+        video.autoplay = true;
+        document.getElementById("controls").innerHTML = "";
+        document.body.appendChild(video);
+
+        document.getElementById("status").innerText = "🔓 Compartilhando a tela...";
+      } catch (err) {
+        console.error("Erro ao capturar tela:", err);
+        document.getElementById("status").innerText = "❌ Erro ao iniciar compartilhamento.";
+      }
+    });
+  </script>
+</body>
+</html>
