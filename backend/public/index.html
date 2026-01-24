@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <title>Admin Console - Lookout</title>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f4f4f4;
+      padding: 20px;
+    }
+
+    h2, h3 {
+      margin-bottom: 10px;
+    }
+
+    ul {
+      padding-left: 20px;
+    }
+
+    li {
+      margin-bottom: 8px;
+    }
+
+    button {
+      padding: 6px 12px;
+      cursor: pointer;
+    }
+
+    #viewer {
+      margin-top: 20px;
+    }
+
+    canvas {
+      border: 2px solid #000;
+      background: #000;
+      width: 100%;
+      max-width: 960px;
+      border-radius: 6px;
+    }
+  </style>
+</head>
+<body>
+
+<h2>🛡️ ADMIN ONLINE</h2>
+<p>Servidor HTTP funcionando.</p>
+
+<h3>Agents Online</h3>
+<ul id="agents"></ul>
+
+<div id="viewer">
+  <h3>📺 Visualização em tempo real</h3>
+  <canvas id="screen" width="1280" height="720"></canvas>
+</div>
+
+<script>
+  // ⚠️ Se estiver usando NGROK, troque ws://localhost pelo wss://xxxx.ngrok-free.dev
+  const ws = new WebSocket("ws://localhost:3010?role=admin");
+
+  const canvas = document.getElementById("screen");
+  const ctx = canvas.getContext("2d");
+
+  let currentAgent = null;
+
+  ws.onopen = () => {
+    console.log("🟦 Admin conectado ao WebSocket");
+  };
+
+  ws.onmessage = (e) => {
+    let msg;
+    try {
+      msg = JSON.parse(e.data);
+    } catch {
+      return;
+    }
+
+    // ===== LISTA DE AGENTS =====
+    if (msg.type === "agents_list") {
+      const ul = document.getElementById("agents");
+      ul.innerHTML = "";
+
+      msg.agents.forEach(deviceId => {
+        const li = document.createElement("li");
+        li.id = "agent-" + deviceId;
+
+        const btn = document.createElement("button");
+        btn.textContent = "Solicitar visualização";
+
+        btn.onclick = () => {
+          currentAgent = deviceId;
+
+          ws.send(JSON.stringify({
+            type: "request_view",
+            deviceId
+          }));
+
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+        };
+
+        li.appendChild(document.createTextNode(deviceId + " "));
+        li.appendChild(btn);
+        ul.appendChild(li);
+      });
+    }
+
+    // ===== VISUALIZAÇÃO ACEITA =====
+    if (msg.type === "view_accepted") {
+      const li = document.getElementById("agent-" + msg.deviceId);
+      if (li) {
+        li.innerHTML = `📺 ${msg.deviceId} — visualização ativa`;
+      }
+    }
+
+    // ===== STREAM DE TELA =====
+    if (msg.type === "screen_frame") {
+      // (futuro: filtrar por agent)
+      const img = new Image();
+      img.onload = () => {
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      };
+      img.src = "data:image/jpeg;base64," + msg.image;
+    }
+  };
+
+  ws.onerror = (err) => {
+    console.error("WS error:", err);
+  };
+</script>
+
+</body>
+</html>

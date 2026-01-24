@@ -1,0 +1,49 @@
+{
+  "name": "monitor-client",
+  "version": "1.0.0",
+  "description": "Agente de monitoramento corporativo (somente visualização)",
+  "main": "desktop-agent/main.js",
+  "type": "commonjs",
+
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder"
+  },
+
+  "author": "",
+  "license": "ISC",
+
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/VitorReis01/dev-app.git"
+  },
+
+  "bugs": {
+    "url": "https://github.com/VitorReis01/dev-app/issues"
+  },
+
+  "homepage": "https://github.com/VitorReis01/dev-app#readme",
+
+  "dependencies": {
+    "express": "^5.2.1",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3"
+  },
+
+  "devDependencies": {
+    "electron": "^39.2.7",
+    "electron-builder": "^26.0.12"
+  },
+
+  "build": {
+    "appId": "empresa.monitor.client",
+    "productName": "Monitor Corporativo",
+    "win": {
+      "target": "nsis"
+    },
+    "directories": {
+      "output": "dist"
+    }
+  }
+}
+
