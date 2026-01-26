@@ -1,1 +1,14 @@
-node_modules
+# Node
+node_modules/
+
+# Builds
+dist/
+build/
+win-unpacked/
+out/
+
+# Electron
+*.exe
+
+# VS Code
+.vscode/
