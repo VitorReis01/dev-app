@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "src/App.jsx",
   "scripts": {
-    "start": "react-scripts start"
+    "start": "cross-env BROWSER=none react-scripts start"
   },
   "dependencies": {
     "npm": "^11.6.0",

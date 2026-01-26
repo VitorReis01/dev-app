@@ -1,36 +1,44 @@
+// preload.js
 const { contextBridge, ipcRenderer, desktopCapturer } = require("electron");
 
+console.log("🔥 PRELOAD NOVO CARREGADO 🔥");
+
 contextBridge.exposeInMainWorld("electronAPI", {
-  // Recebe solicitação de consentimento do backend
+ __buildTag: "LOOKOUT-1.0.2-PRELOAD",
+
+
+  // config
+  getConfig: () => ipcRenderer.invoke("get-config"),
+  saveConfig: (cfg) => ipcRenderer.invoke("save-config", cfg),
+  onNeedConfig: (callback) => ipcRenderer.on("need-config", () => callback()),
+
+  // WS conectado
+  onWsConnected: (callback) => ipcRenderer.on("ws-connected", () => callback()),
+
+  // consent flow
   onConsentRequest: (callback) =>
-    ipcRenderer.on("consent-request", (event, admin) => callback(admin)),
+    ipcRenderer.on("consent-request", (_event, admin) => callback(admin)),
+  sendConsentResponse: (accepted) => ipcRenderer.send("consent-response", accepted),
 
-  // Envia resposta do usuário (Aceitar/Negar)
-  sendConsentResponse: (accepted) =>
-    ipcRenderer.send("consent-response", accepted),
-
-  // Recebe evento para iniciar captura de tela
-  onStartScreenShare: (callback) =>
-    ipcRenderer.on("start-screen-share", callback),
-
-  // Recebe aviso quando um admin se conecta
   onAdminConnected: (callback) =>
-    ipcRenderer.on("admin-connected", (event, admin) => callback(admin)),
+    ipcRenderer.on("admin-connected", (_event, admin) => callback(admin)),
 
-  // Função que pega o stream da tela
-  getScreenStream: async () => {
-    const sources = await desktopCapturer.getSources({ types: ["screen"] });
+  onStartScreenShare: (callback) =>
+    ipcRenderer.on("start-screen-share", (_evt, payload) => callback(payload)),
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: {
-        mandatory: {
-          chromeMediaSource: "desktop",
-          chromeMediaSourceId: sources[0].id
-        }
-      }
+  reportScreenShareStatus: (payload) => ipcRenderer.send("screen-share-status", payload),
+
+  // captura: lista fontes via preload
+  getDesktopSources: async () => {
+    const sources = await desktopCapturer.getSources({
+      types: ["screen", "window"],
+      thumbnailSize: { width: 0, height: 0 },
     });
 
-    return stream;
-  }
+    if (!sources || sources.length === 0) {
+      throw new Error("Nenhuma fonte encontrada no desktopCapturer.");
+    }
+
+    return sources.map((s) => ({ id: s.id, name: s.name }));
+  },
 });

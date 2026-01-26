@@ -1,36 +1,32 @@
 {
-  "name": "desktop-agent",
-  "version": "1.0.0",
-  "description": "Agente desktop para monitoramento e suporte remoto",
-  "author": "Sua Empresa <email@suaempresa.com>",
+  "name": "lookout-desktop-agent",
+  "version": "1.0.2",
+  "description": "Lookout Desktop Agent",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "dist": "electron-builder"
+    "dist:win": "electron-builder --win"
   },
   "build": {
-    "appId": "com.suaempresa.desktopagent",
-    "productName": "Desktop Agent",
-    "files": [
-      "main.js",
-      "preload.js",
-      "index.html",
-      "package.json",
-      "node_modules/*/"
-    ],
-    "directories": {
-      "buildResources": "assets",
-      "output": "dist"
-    },
+    "appId": "br.com.imstech.desktopagent",
+    "productName": "Lookout",
+    "artifactName": "Lookout Setup ${version}.${ext}",
     "win": {
       "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Lookout"
     }
   },
-  "dependencies": {
-    "ws": "^8.14.2"
-  },
   "devDependencies": {
-    "electron": "^25.0.0",
-    "electron-builder": "^26.0.12"
+    "electron": "^40.0.0",
+    "electron-builder": "^26.4.0"
+  },
+  "dependencies": {
+    "ws": "^8.19.0"
   }
 }

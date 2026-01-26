@@ -1,89 +1,260 @@
 <!DOCTYPE html>
 <html lang="pt-BR">
+
 <head>
-  <meta charset="UTF-8">
-  <title>Desktop Agent</title>
+  <meta charset="UTF-8" />
+  <title>Lookout</title>
+
   <style>
     body {
       font-family: Arial, sans-serif;
       margin: 20px;
       background: #f5f5f5;
     }
+
     h2 {
       margin-bottom: 10px;
     }
+
     #status {
       margin: 10px 0;
       padding: 10px;
       background: #eee;
       border-radius: 5px;
     }
+
+    .card {
+      background: #fff;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid #ddd;
+    }
+
+    label {
+      display: block;
+      margin-top: 10px;
+      font-size: 13px;
+    }
+
+    input {
+      width: 100%;
+      padding: 8px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+    }
+
     button {
-      margin: 5px;
-      padding: 8px 15px;
+      margin-top: 12px;
+      padding: 10px 14px;
       font-size: 14px;
       cursor: pointer;
       border: none;
-      border-radius: 4px;
+      border-radius: 6px;
     }
-    button.accept { background: #4CAF50; color: white; }
-    button.deny { background: #f44336; color: white; }
+
+    button.primary {
+      background: #2563eb;
+      color: #fff;
+    }
+
+    button.accept {
+      background: #4CAF50;
+      color: white;
+    }
+
+    button.deny {
+      background: #f44336;
+      color: white;
+      margin-left: 8px;
+    }
+
     video {
       width: 100%;
       height: auto;
       margin-top: 15px;
       border: 2px solid #333;
       border-radius: 5px;
+      background: #000;
+    }
+
+    .row {
+      display: flex;
+      gap: 10px;
+    }
+
+    .row>button {
+      flex: 1;
     }
   </style>
 </head>
+
 <body>
-  <h2>Desktop Agent</h2>
-  <div id="status">🔌 Aguardando conexão...</div>
+  <h2>Lookout</h2>
+
+  <div id="status">🔌 Iniciando...</div>
+
+  <div id="setup" class="card" style="display:none;">
+    <h3 style="margin:0 0 8px 0;">Configurar conexão</h3>
+    <div style="font-size:13px; color:#444;">
+      Este PC precisa do <b>Device ID</b> e <b>Token</b> para conectar.
+    </div>
+
+    <label>URL (WebSocket)</label>
+    <input id="cfgUrl" placeholder="wss://ws.imstech.net.br" />
+
+    <label>Device ID</label>
+    <input id="cfgDeviceId" placeholder="ex: device2" />
+
+    <label>Token</label>
+    <input id="cfgToken" placeholder="ex: device-token" />
+
+    <button class="primary" id="btnSave">Salvar e Conectar</button>
+    <div id="setupMsg" style="margin-top:10px; font-size:13px;"></div>
+  </div>
+
   <div id="controls"></div>
 
   <script>
-    // Quando admin pede acesso
+    /* ===== DEBUG (confirma build + preload) ===== */
+    console.log("INDEX NOVO OK ✅", window.electronAPI?.__buildTag);
+    console.log("electronAPI keys:", Object.keys(window.electronAPI || {}));
+
+    const statusEl = document.getElementById("status");
+    const controlsEl = document.getElementById("controls");
+
+    const setupEl = document.getElementById("setup");
+    const cfgUrl = document.getElementById("cfgUrl");
+    const cfgDeviceId = document.getElementById("cfgDeviceId");
+    const cfgToken = document.getElementById("cfgToken");
+    const setupMsg = document.getElementById("setupMsg");
+    const btnSave = document.getElementById("btnSave");
+
+    function showSetup(message) {
+      setupEl.style.display = "block";
+      controlsEl.innerHTML = "";
+      statusEl.innerText = "⚙️ Precisa configurar para conectar.";
+      setupMsg.textContent = message || "";
+    }
+
+    async function loadConfig() {
+      const cfg = await window.electronAPI.getConfig();
+      if (!cfg) {
+        cfgUrl.value = "wss://ws.imstech.net.br";
+        showSetup("Cole o Device ID e Token e clique em Salvar.");
+        return;
+      }
+
+      cfgUrl.value = cfg.url || "wss://ws.imstech.net.br";
+      cfgDeviceId.value = cfg.deviceId || "";
+      cfgToken.value = cfg.token || "";
+      setupEl.style.display = "none";
+      statusEl.innerText = "🔌 Aguardando conexão...";
+    }
+
+    window.electronAPI.onNeedConfig(() => {
+      showSetup("Config não encontrada. Preencha para conectar.");
+    });
+
+    btnSave.addEventListener("click", async () => {
+      setupMsg.textContent = "";
+
+      const res = await window.electronAPI.saveConfig({
+        url: cfgUrl.value,
+        deviceId: cfgDeviceId.value,
+        token: cfgToken.value,
+      });
+
+      if (!res?.ok) {
+        setupMsg.style.color = "#b91c1c";
+        setupMsg.textContent = res?.error || "Erro ao salvar.";
+        return;
+      }
+
+      setupMsg.style.color = "#166534";
+      setupMsg.textContent = "✅ Salvo! Conectando...";
+      setupEl.style.display = "none";
+      statusEl.innerText = "🔌 Conectando...";
+    });
+
+    window.electronAPI.onWsConnected(() => {
+      statusEl.innerText = "🟢 Conectado ao servidor.";
+      setupEl.style.display = "none";
+    });
+
     window.electronAPI.onConsentRequest((admin) => {
-      document.getElementById("status").innerText = 
-        `⚠️ O administrador ${admin} solicitou acesso à sua tela.`;
-
-      document.getElementById("controls").innerHTML = `
-        <button class="accept" id="accept">Aceitar</button>
-        <button class="deny" id="deny">Negar</button>
+      statusEl.innerText = `⚠️ O administrador ${admin} solicitou acesso à sua tela.`;
+      controlsEl.innerHTML = `
+        <div class="row">
+          <button class="accept" id="accept">Aceitar</button>
+          <button class="deny" id="deny">Negar</button>
+        </div>
       `;
-
-      document.getElementById("accept").addEventListener("click", () => {
-        window.electronAPI.sendConsentResponse(true);
-      });
-
-      document.getElementById("deny").addEventListener("click", () => {
-        window.electronAPI.sendConsentResponse(false);
-      });
+      document.getElementById("accept").onclick =
+        () => window.electronAPI.sendConsentResponse(true);
+      document.getElementById("deny").onclick =
+        () => window.electronAPI.sendConsentResponse(false);
     });
 
-    // Quando admin conecta
     window.electronAPI.onAdminConnected((admin) => {
-      document.getElementById("status").innerText = 
-        `✅ O administrador ${admin} está online.`;
+      statusEl.innerText = `✅ O administrador ${admin} está online.`;
     });
 
-    // Quando usuário aceitou → começa a captura de tela
+    async function startScreenShare() {
+      const sources = await window.electronAPI.getDesktopSources();
+
+      const preferred =
+        sources.find(s => /screen|tela|display|monitor/i.test(s.name)) ||
+        sources.find(s => /entire|primary/i.test(s.name)) ||
+        sources[0];
+
+      if (!preferred?.id) {
+        throw new Error("Não foi possível selecionar uma fonte de tela.");
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          mandatory: {
+            chromeMediaSource: "desktop",
+            chromeMediaSourceId: preferred.id,
+          },
+        },
+      });
+
+      return { stream, sourceName: preferred.name };
+    }
+
     window.electronAPI.onStartScreenShare(async () => {
       try {
-        const stream = await window.electronAPI.getScreenStream();
+        const { stream, sourceName } = await startScreenShare();
+
         const video = document.createElement("video");
         video.srcObject = stream;
         video.autoplay = true;
-        document.getElementById("controls").innerHTML = "";
+        video.muted = true;
+        video.playsInline = true;
+
+        controlsEl.innerHTML = "";
         document.body.appendChild(video);
 
-        document.getElementById("status").innerText = "🔓 Compartilhando a tela...";
+        statusEl.innerText = `🔓 Compartilhando a tela (${sourceName})...`;
+
+        window.electronAPI.reportScreenShareStatus?.({
+          ok: true,
+          sourceName
+        });
       } catch (err) {
-        console.error("Erro ao capturar tela:", err);
-        document.getElementById("status").innerText = "❌ Erro ao iniciar compartilhamento.";
+        console.error(err);
+        statusEl.innerText = "❌ Erro ao iniciar compartilhamento.";
+        window.electronAPI.reportScreenShareStatus?.({
+          ok: false,
+          error: err?.message || String(err),
+        });
       }
     });
+
+    loadConfig();
   </script>
 </body>
+
 </html>
