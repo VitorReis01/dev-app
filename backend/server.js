@@ -1,3 +1,5 @@
+"use strict";
+
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
@@ -14,43 +16,102 @@ app.use(express.json());
 
 const JWT_SECRET = "supersecretkey";
 
-// Dados em memória (simulação)
-const admins = [
-  { id: 1, username: "admin", passwordHash: bcrypt.hashSync("admin123", 10) }
+// ============================
+// In-memory data (MVP)
+// ============================
+const adminsSeed = [
+  { id: 1, username: "admin", passwordHash: bcrypt.hashSync("admin123", 10) },
 ];
 
+// ✅ Devices em memória (agora com auto-register)
+// Campo canônico: connected (bool)
+// Campo compat front: online (alias em REST)
 const devices = [
   { id: "device1", name: "PC do João", user: "João", connected: false },
-  { id: "device2", name: "Device 2", user: "User 2", connected: false }
+  { id: "device2", name: "Device 2", user: "User 2", connected: false },
+  // Você pode manter esse aqui ou remover: com auto-register não é obrigatório
+  { id: "device-user01", name: "User 01", user: "User01", connected: false },
 ];
 
 const logs = [];
-const wsClients = new Map(); // deviceId -> ws (AGENT)
 
-// último frame por dispositivo (dataURL jpeg)
+// WS sessions
+const wsAgentsByDeviceId = new Map(); // deviceId -> ws
+// last frame por dispositivo (dataURL jpeg)
 const lastFrameByDevice = {}; // { [deviceId]: "data:image/jpeg;base64,..." }
 
-// ✅ throttle simples por device (pra não travar tudo)
+// throttle por device
 const lastFrameSentAtByDevice = {}; // { [deviceId]: number(ms) }
-const MIN_FRAME_INTERVAL_MS = 120; // ~8 fps no máximo (ajuste aqui)
+const MIN_FRAME_INTERVAL_MS = 120; // ~8 fps
+
+// Presence TTL (anti-zumbi)
+const PRESENCE_TTL_MS = 15_000;
+const HEARTBEAT_TYPE = "ping"; // msg.type esperado do agent (JSON)
+
+// ============================
+// Helpers
+// ============================
+function nowMs() {
+  return Date.now();
+}
+
+function normDeviceId(id) {
+  return String(id || "").trim();
+}
+
+function findDevice(deviceId) {
+  return devices.find((d) => d.id === deviceId);
+}
+
+function toDeviceDTO(d) {
+  return {
+    id: d.id,
+    name: d.name,
+    user: d.user,
+    connected: !!d.connected,
+    online: !!d.connected, // alias para front
+    lastSeen: d.lastSeen,
+    agentVersion: d.agentVersion,
+  };
+}
+
+function safeSend(ws, payloadObj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  ws.send(JSON.stringify(payloadObj));
+  return true;
+}
+
+function broadcastToAdmins(payloadObj) {
+  wss.clients.forEach((client) => {
+    if (client.isAdmin && client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify(payloadObj));
+    }
+  });
+}
+
+function emitPresence(deviceId, online, device) {
+  broadcastToAdmins({
+    type: "device_presence",
+    deviceId,
+    online: !!online,
+    lastSeen: device?.lastSeen ?? null,
+    agentVersion: device?.agentVersion ?? null,
+    ts: nowMs(),
+  });
+}
 
 // ============================
 // Auth
 // ============================
 app.post("/api/login", (req, res) => {
-  const { username, password } = req.body;
-  const admin = admins.find((a) => a.username === username);
+  const { username, password } = req.body || {};
+  const admin = adminsSeed.find((a) => a.username === username);
 
-  if (!admin || !bcrypt.compareSync(password, admin.passwordHash)) {
+  if (!admin || !bcrypt.compareSync(String(password || ""), admin.passwordHash)) {
     return res.status(401).json({ error: "Credenciais inválidas" });
   }
 
-  const token = jwt.sign(
-    { id: admin.id, username: admin.username },
-    JWT_SECRET,
-    { expiresIn: "1h" }
-  );
-
+  const token = jwt.sign({ id: admin.id, username: admin.username }, JWT_SECRET, { expiresIn: "1h" });
   res.json({ token, user: { id: admin.id, username: admin.username } });
 });
 
@@ -72,7 +133,8 @@ function authenticateAdmin(req, res, next) {
 // REST
 // ============================
 app.get("/api/devices", authenticateAdmin, (req, res) => {
-  res.json(devices);
+  // retorna DTO com alias online
+  res.json(devices.map(toDeviceDTO));
 });
 
 app.get("/api/logs", authenticateAdmin, (req, res) => {
@@ -81,9 +143,8 @@ app.get("/api/logs", authenticateAdmin, (req, res) => {
 
 // endpoint HTTP pra buscar a tela (fallback / debug)
 app.get("/api/devices/:id/frame", (req, res) => {
-  const deviceId = req.params.id;
+  const deviceId = normDeviceId(req.params.id);
   const jpeg = lastFrameByDevice[deviceId];
-
   if (!jpeg) return res.status(404).send("no frame");
 
   const base64 = String(jpeg).split(",")[1];
@@ -98,220 +159,290 @@ app.get("/api/devices/:id/frame", (req, res) => {
 });
 
 // ============================
-// WebSocket (admin ↔ dispositivos)
+// WebSocket
 // ============================
+function parseQuery(reqUrl) {
+  const raw = reqUrl || "";
+  const qs = raw.startsWith("/?") ? raw.slice(2) : raw.replace("/", "");
+  return new URLSearchParams(qs);
+}
+
+function verifyAdminToken(token) {
+  if (!token) throw new Error("missing token");
+  return jwt.verify(token, JWT_SECRET);
+}
+
+function sendDevicesSnapshot(ws) {
+  safeSend(ws, {
+    type: "devices_snapshot",
+    devices: devices.map((d) => ({
+      deviceId: d.id,
+      online: !!d.connected,
+      connected: !!d.connected,
+      lastSeen: d.lastSeen,
+      agentVersion: d.agentVersion,
+    })),
+    ts: nowMs(),
+  });
+}
+
+function handleAgent(ws, deviceId, params) {
+  // ✅ AUTO-REGISTER: se o device não existir, cria na hora
+  let d = findDevice(deviceId);
+  if (!d) {
+    d = {
+      id: deviceId,
+      name: deviceId,
+      user: "unknown",
+      connected: false,
+      lastSeen: null,
+      agentVersion: null,
+    };
+    devices.push(d);
+    console.log(`🆕 Registrando novo dispositivo automaticamente: ${deviceId}`);
+  }
+
+  // meta: versão do agent (opcional por query ?v=1.0.3)
+  const agentVersion = params.get("v") || null;
+
+  d.connected = true;
+  d.lastSeen = nowMs();
+  if (agentVersion) d.agentVersion = agentVersion;
+
+  wsAgentsByDeviceId.set(deviceId, ws);
+
+  ws.isAgent = true;
+  ws.deviceId = deviceId;
+
+  console.log(`✅ Dispositivo ${deviceId} conectado (agent)`);
+
+  // avisa admins imediatamente
+  emitPresence(deviceId, true, d);
+
+  ws.on("message", (msg) => {
+    let data;
+    try {
+      data = JSON.parse(msg.toString());
+    } catch {
+      return;
+    }
+
+    // Heartbeat do agent (presença)
+    if (data?.type === HEARTBEAT_TYPE) {
+      const dev = findDevice(deviceId);
+      if (dev) dev.lastSeen = nowMs();
+      safeSend(ws, { type: "pong", ts: nowMs() });
+      return;
+    }
+
+    // ✅ CONSENT
+    if (data.type === "consent_response") {
+      logs.push({
+        deviceId,
+        action: "consent_response",
+        accepted: !!data.accepted,
+        timestamp: new Date(),
+      });
+
+      broadcastToAdmins({
+        type: "consent_response",
+        deviceId,
+        accepted: !!data.accepted,
+      });
+
+      return;
+    }
+
+    // ✅ REALTIME: FRAME -> salva e repassa pros ADMINS
+    if (data.type === "screen_frame") {
+      if (data.deviceId && typeof data.jpeg === "string") {
+        const fid = normDeviceId(data.deviceId);
+
+        // salva último frame (para endpoint HTTP)
+        lastFrameByDevice[fid] = data.jpeg;
+
+        // throttle por device
+        const now = nowMs();
+        const last = lastFrameSentAtByDevice[fid] || 0;
+        if (now - last < MIN_FRAME_INTERVAL_MS) return;
+        lastFrameSentAtByDevice[fid] = now;
+
+        broadcastToAdmins({
+          type: "screen_frame",
+          deviceId: fid,
+          jpeg: data.jpeg,
+          ts: data.ts || now,
+        });
+      }
+      return;
+    }
+  });
+
+  ws.on("close", (code) => {
+    const current = wsAgentsByDeviceId.get(deviceId);
+    if (current === ws) {
+      wsAgentsByDeviceId.delete(deviceId);
+    }
+
+    const dev = findDevice(deviceId);
+    if (dev) dev.connected = false;
+
+    console.log(`🔌 Dispositivo ${deviceId} desconectado (code=${code})`);
+
+    if (dev) emitPresence(deviceId, false, dev);
+  });
+
+  ws.on("error", (err) => {
+    console.log(`⚠️ WS agent error (${deviceId}):`, err.message);
+  });
+}
+
+function handleAdmin(ws, token) {
+  let decoded;
+  try {
+    decoded = verifyAdminToken(token);
+  } catch {
+    return ws.close(1008, "invalid admin token");
+  }
+
+  ws.isAdmin = true;
+  ws.adminId = decoded.id;
+  ws.adminUser = decoded.username;
+
+  console.log(`✅ Admin ${decoded.username} conectado`);
+
+  // snapshot inicial
+  sendDevicesSnapshot(ws);
+
+  ws.on("message", (msg) => {
+    let data;
+    try {
+      data = JSON.parse(msg.toString());
+    } catch {
+      return;
+    }
+
+    if (data.type === "request_remote_access") {
+      const targetDeviceId = normDeviceId(data.deviceId);
+      const deviceWs = wsAgentsByDeviceId.get(targetDeviceId);
+
+      if (deviceWs && deviceWs.readyState === WebSocket.OPEN) {
+        logs.push({
+          adminId: decoded.id,
+          deviceId: targetDeviceId,
+          action: "request_remote_access",
+          timestamp: new Date(),
+        });
+
+        safeSend(deviceWs, {
+          type: "consent_request",
+          admin: decoded.username,
+        });
+      } else {
+        safeSend(ws, {
+          type: "error",
+          message: "Dispositivo offline",
+        });
+      }
+      return;
+    }
+
+    if (data.type === "get_last_frame" && data.deviceId) {
+      const id = normDeviceId(data.deviceId);
+      const jpeg = lastFrameByDevice[id];
+      if (jpeg) {
+        safeSend(ws, {
+          type: "screen_frame",
+          deviceId: id,
+          jpeg,
+          ts: nowMs(),
+        });
+      }
+      return;
+    }
+  });
+
+  ws.on("close", (code) => {
+    console.log(`🔌 Admin ${decoded.username} desconectado (code=${code})`);
+  });
+
+  ws.on("error", (err) => {
+    console.log(`⚠️ WS admin error (${decoded.username}):`, err.message);
+  });
+}
+
 wss.on("connection", (ws, req) => {
-  const qs = (req.url || "").startsWith("/?")
-    ? (req.url || "").slice(2)
-    : (req.url || "").replace("/", "");
-  const params = new URLSearchParams(qs);
+  const params = parseQuery(req.url);
 
   const role = params.get("role");             // "agent" | "admin"
-  const deviceId = params.get("deviceId");     // ex: "device2"
+  const deviceIdRaw = params.get("deviceId");  // ex: "device2"
   const token = params.get("token");           // padrão novo
   const adminToken = params.get("adminToken"); // compat antiga
   const effectiveAdminToken = adminToken || token;
 
-  console.log("[WS] connection:", { role, deviceId, hasToken: !!token, hasAdminToken: !!adminToken });
+  const deviceId = normDeviceId(deviceIdRaw);
+
+  console.log("[WS] connection:", {
+    role,
+    deviceId: deviceId || null,
+    hasToken: !!token,
+    hasAdminToken: !!adminToken,
+  });
 
   // ========== AGENT ==========
   if (role === "agent") {
     if (!deviceId) return ws.close(1008, "deviceId required");
-
-    const device = devices.find((d) => d.id === deviceId);
-    if (!device) return ws.close(1008, "unknown device");
-
-    device.connected = true;
-    wsClients.set(deviceId, ws);
-    ws.isAgent = true;
-    ws.deviceId = deviceId;
-
-    console.log(`✅ Dispositivo ${deviceId} conectado (agent)`);
-
-    ws.on("message", (msg) => {
-      let data;
-      try {
-        data = JSON.parse(msg.toString());
-      } catch {
-        return;
-      }
-
-      // ✅ CONSENT
-      if (data.type === "consent_response") {
-        logs.push({
-          deviceId,
-          action: "consent_response",
-          accepted: !!data.accepted,
-          timestamp: new Date()
-        });
-
-        // Notificar admins conectados
-        wss.clients.forEach((client) => {
-          if (client.isAdmin && client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({
-              type: "consent_response",
-              deviceId,
-              accepted: !!data.accepted
-            }));
-          }
-        });
-      }
-
-      // ✅ REALTIME: FRAME DA TELA -> salva e repassa pros ADMINS
-      if (data.type === "screen_frame") {
-        if (data.deviceId && typeof data.jpeg === "string") {
-          // salva último frame (para endpoint HTTP)
-          lastFrameByDevice[data.deviceId] = data.jpeg;
-
-          // throttle por device (evita travar)
-          const now = Date.now();
-          const last = lastFrameSentAtByDevice[data.deviceId] || 0;
-          if (now - last < MIN_FRAME_INTERVAL_MS) return;
-          lastFrameSentAtByDevice[data.deviceId] = now;
-
-          // manda AO VIVO pros admins via WS
-          const payload = JSON.stringify({
-            type: "screen_frame",
-            deviceId: data.deviceId,
-            jpeg: data.jpeg,
-            ts: data.ts || now
-          });
-
-          wss.clients.forEach((client) => {
-            if (client.isAdmin && client.readyState === WebSocket.OPEN) {
-              client.send(payload);
-            }
-          });
-        }
-      }
-    });
-
-    ws.on("close", (code) => {
-      const current = wsClients.get(deviceId);
-      if (current === ws) {
-        device.connected = false;
-        wsClients.delete(deviceId);
-      }
-      console.log(`🔌 Dispositivo ${deviceId} desconectado (code=${code})`);
-    });
-
-    ws.on("error", (err) => {
-      console.log(`⚠️ WS agent error (${deviceId}):`, err.message);
-    });
-
-    return;
+    return handleAgent(ws, deviceId, params);
   }
 
   // ========== ADMIN ==========
   if (role === "admin") {
     if (!effectiveAdminToken) return ws.close(1008, "admin token required");
-
-    try {
-      const decoded = jwt.verify(effectiveAdminToken, JWT_SECRET);
-
-      ws.isAdmin = true;
-      ws.adminId = decoded.id;
-      ws.adminUser = decoded.username;
-
-      console.log(`✅ Admin ${decoded.username} conectado`);
-
-      ws.on("message", (msg) => {
-        let data;
-        try {
-          data = JSON.parse(msg.toString());
-        } catch {
-          return;
-        }
-
-        if (data.type === "request_remote_access") {
-          const targetDeviceId = data.deviceId;
-          const deviceWs = wsClients.get(targetDeviceId);
-
-          if (deviceWs && deviceWs.readyState === WebSocket.OPEN) {
-            logs.push({
-              adminId: decoded.id,
-              deviceId: targetDeviceId,
-              action: "request_remote_access",
-              timestamp: new Date()
-            });
-
-            deviceWs.send(JSON.stringify({
-              type: "consent_request",
-              admin: decoded.username
-            }));
-          } else {
-            ws.send(JSON.stringify({
-              type: "error",
-              message: "Dispositivo offline"
-            }));
-          }
-        }
-
-        // opcional: admin pedir o último frame imediatamente (caso precise)
-        if (data.type === "get_last_frame" && data.deviceId) {
-          const jpeg = lastFrameByDevice[data.deviceId];
-          if (jpeg && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({
-              type: "screen_frame",
-              deviceId: data.deviceId,
-              jpeg,
-              ts: Date.now()
-            }));
-          }
-        }
-      });
-
-      ws.on("close", (code) => {
-        console.log(`🔌 Admin ${decoded.username} desconectado (code=${code})`);
-      });
-
-      ws.on("error", (err) => {
-        console.log(`⚠️ WS admin error (${decoded.username}):`, err.message);
-      });
-
-      return;
-    } catch {
-      return ws.close(1008, "invalid admin token");
-    }
+    return handleAdmin(ws, effectiveAdminToken);
   }
 
-  // ========== FALLBACK (compat) ==========
+  // ========== FALLBACK COMPAT ==========
   if (deviceId) {
-    const device = devices.find((d) => d.id === deviceId);
-    if (!device) return ws.close(1008, "unknown device");
-
-    device.connected = true;
-    wsClients.set(deviceId, ws);
-    ws.isAgent = true;
-    ws.deviceId = deviceId;
-
-    console.log(`✅ Dispositivo ${deviceId} conectado (agent compat)`);
-
-    ws.on("close", () => {
-      const current = wsClients.get(deviceId);
-      if (current === ws) {
-        device.connected = false;
-        wsClients.delete(deviceId);
-      }
-      console.log(`🔌 Dispositivo ${deviceId} desconectado (compat)`);
-    });
-
-    return;
+    console.log(`ℹ️ Conexão compat detectada. Tratando como agent: ${deviceId}`);
+    return handleAgent(ws, deviceId, params);
   }
 
   if (effectiveAdminToken) {
-    try {
-      const decoded = jwt.verify(effectiveAdminToken, JWT_SECRET);
-      ws.isAdmin = true;
-      ws.adminId = decoded.id;
-      console.log(`✅ Admin ${decoded.username} conectado (compat)`);
-      return;
-    } catch {
-      return ws.close(1008, "invalid admin token");
-    }
+    console.log(`ℹ️ Conexão compat detectada. Tratando como admin.`);
+    return handleAdmin(ws, effectiveAdminToken);
   }
 
   ws.close(1008, "missing role");
 });
 
-server.listen(3001, "0.0.0.0", () => console.log("Backend rodando na porta 3001"));
+// ============================
+// Presence TTL job (anti-zumbi)
+// ============================
+setInterval(() => {
+  const now = nowMs();
+
+  for (const d of devices) {
+    if (!d.connected) continue;
+
+    const last = d.lastSeen || 0;
+    if (now - last <= PRESENCE_TTL_MS) continue;
+
+    const ws = wsAgentsByDeviceId.get(d.id);
+    try {
+      if (ws && ws.readyState !== WebSocket.CLOSED) ws.terminate();
+    } catch {}
+
+    wsAgentsByDeviceId.delete(d.id);
+    d.connected = false;
+
+    console.log(`⏱️ PRESENCE TTL: marcando offline ${d.id}`);
+    emitPresence(d.id, false, d);
+  }
+}, 5000);
+
+// ============================
+// Start
+// ============================
+server.listen(3001, "0.0.0.0", () => {
+  console.log("Backend rodando na porta 3001");
+});

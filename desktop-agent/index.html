@@ -1,90 +1,23 @@
 <!DOCTYPE html>
 <html lang="pt-BR">
-
 <head>
   <meta charset="UTF-8" />
   <title>Lookout</title>
 
   <style>
-    body {
-      font-family: Arial, sans-serif;
-      margin: 20px;
-      background: #f5f5f5;
-    }
-
-    h2 {
-      margin-bottom: 10px;
-    }
-
-    #status {
-      margin: 10px 0;
-      padding: 10px;
-      background: #eee;
-      border-radius: 5px;
-    }
-
-    .card {
-      background: #fff;
-      padding: 12px;
-      border-radius: 8px;
-      border: 1px solid #ddd;
-    }
-
-    label {
-      display: block;
-      margin-top: 10px;
-      font-size: 13px;
-    }
-
-    input {
-      width: 100%;
-      padding: 8px;
-      border: 1px solid #ccc;
-      border-radius: 6px;
-    }
-
-    button {
-      margin-top: 12px;
-      padding: 10px 14px;
-      font-size: 14px;
-      cursor: pointer;
-      border: none;
-      border-radius: 6px;
-    }
-
-    button.primary {
-      background: #2563eb;
-      color: #fff;
-    }
-
-    button.accept {
-      background: #4CAF50;
-      color: white;
-    }
-
-    button.deny {
-      background: #f44336;
-      color: white;
-      margin-left: 8px;
-    }
-
-    video {
-      width: 100%;
-      height: auto;
-      margin-top: 15px;
-      border: 2px solid #333;
-      border-radius: 5px;
-      background: #000;
-    }
-
-    .row {
-      display: flex;
-      gap: 10px;
-    }
-
-    .row>button {
-      flex: 1;
-    }
+    body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+    h2 { margin-bottom: 10px; }
+    #status { margin: 10px 0; padding: 10px; background: #eee; border-radius: 5px; }
+    .card { background: #fff; padding: 12px; border-radius: 8px; border: 1px solid #ddd; }
+    label { display: block; margin-top: 10px; font-size: 13px; }
+    input { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 6px; }
+    button { margin-top: 12px; padding: 10px 14px; font-size: 14px; cursor: pointer; border: none; border-radius: 6px; }
+    button.primary { background: #2563eb; color: #fff; }
+    button.accept { background: #4CAF50; color: white; }
+    button.deny { background: #f44336; color: white; margin-left: 8px; }
+    .row { display: flex; gap: 10px; }
+    .row > button { flex: 1; }
+    .hint { margin-top: 10px; font-size: 12px; color: #555; }
   </style>
 </head>
 
@@ -100,16 +33,20 @@
     </div>
 
     <label>URL (WebSocket)</label>
-    <input id="cfgUrl" placeholder="wss://ws.imstech.net.br" />
+    <input id="cfgUrl" placeholder="ws://localhost:3001" />
 
     <label>Device ID</label>
-    <input id="cfgDeviceId" placeholder="ex: device2" />
+    <input id="cfgDeviceId" placeholder="ex: device1" />
 
     <label>Token</label>
-    <input id="cfgToken" placeholder="ex: device-token" />
+    <input id="cfgToken" placeholder="ex: test" />
 
     <button class="primary" id="btnSave">Salvar e Conectar</button>
     <div id="setupMsg" style="margin-top:10px; font-size:13px;"></div>
+
+    <div class="hint">
+      Dica local: use <b>ws://localhost:3001</b>
+    </div>
   </div>
 
   <div id="controls"></div>
@@ -139,12 +76,12 @@
     async function loadConfig() {
       const cfg = await window.electronAPI.getConfig();
       if (!cfg) {
-        cfgUrl.value = "wss://ws.imstech.net.br";
+        cfgUrl.value = "ws://localhost:3001";
         showSetup("Cole o Device ID e Token e clique em Salvar.");
         return;
       }
 
-      cfgUrl.value = cfg.url || "wss://ws.imstech.net.br";
+      cfgUrl.value = cfg.url || "ws://localhost:3001";
       cfgDeviceId.value = cfg.deviceId || "";
       cfgToken.value = cfg.token || "";
       setupEl.style.display = "none";
@@ -181,23 +118,16 @@
       setupEl.style.display = "none";
     });
 
-    window.electronAPI.onConsentRequest((admin) => {
-      statusEl.innerText = `⚠️ O administrador ${admin} solicitou acesso à sua tela.`;
-      controlsEl.innerHTML = `
-        <div class="row">
-          <button class="accept" id="accept">Aceitar</button>
-          <button class="deny" id="deny">Negar</button>
-        </div>
-      `;
-      document.getElementById("accept").onclick =
-        () => window.electronAPI.sendConsentResponse(true);
-      document.getElementById("deny").onclick =
-        () => window.electronAPI.sendConsentResponse(false);
-    });
-
     window.electronAPI.onAdminConnected((admin) => {
       statusEl.innerText = `✅ O administrador ${admin} está online.`;
     });
+
+    // ==========================
+    // CAPTURA + ENVIO DE FRAMES
+    // ==========================
+    let captureTimer = null;
+    let activeStream = null;
+    let lastAdminName = null;
 
     async function startScreenShare() {
       const sources = await window.electronAPI.getDesktopSources();
@@ -207,9 +137,7 @@
         sources.find(s => /entire|primary/i.test(s.name)) ||
         sources[0];
 
-      if (!preferred?.id) {
-        throw new Error("Não foi possível selecionar uma fonte de tela.");
-      }
+      if (!preferred?.id) throw new Error("Não foi possível selecionar uma fonte de tela.");
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
@@ -224,37 +152,102 @@
       return { stream, sourceName: preferred.name };
     }
 
-    window.electronAPI.onStartScreenShare(async () => {
-      try {
-        const { stream, sourceName } = await startScreenShare();
+    async function startSendingFrames() {
+      if (captureTimer) return;
 
-        const video = document.createElement("video");
-        video.srcObject = stream;
-        video.autoplay = true;
-        video.muted = true;
-        video.playsInline = true;
+      const cfg = await window.electronAPI.getConfig();
+      if (!cfg?.deviceId) throw new Error("Sem deviceId no config.");
+
+      const { stream, sourceName } = await startScreenShare();
+      activeStream = stream;
+
+      // video OFFSCREEN (NÃO anexar no DOM)
+      const video = document.createElement("video");
+      video.srcObject = stream;
+      video.muted = true;
+      video.playsInline = true;
+      await video.play();
+
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+      statusEl.innerText = `📤 Enviando tela (${sourceName}) para o admin...`;
+
+      captureTimer = setInterval(() => {
+        try {
+          const w = video.videoWidth || 1280;
+          const h = video.videoHeight || 720;
+
+          canvas.width = w;
+          canvas.height = h;
+
+          ctx.drawImage(video, 0, 0, w, h);
+
+          // base64 jpeg
+          const jpeg = canvas.toDataURL("image/jpeg", 0.6);
+
+          window.electronAPI.sendScreenFrame?.({
+            type: "screen_frame",
+            deviceId: cfg.deviceId,
+            jpeg,
+            ts: Date.now(),
+          });
+        } catch (e) {
+          console.error("frame error:", e);
+        }
+      }, 200); // ~5fps
+    }
+
+    function stopSendingFrames() {
+      if (captureTimer) {
+        clearInterval(captureTimer);
+        captureTimer = null;
+      }
+      if (activeStream) {
+        activeStream.getTracks().forEach(t => t.stop());
+        activeStream = null;
+      }
+    }
+
+    // ==========================
+    // CONSENT UI
+    // ==========================
+    window.electronAPI.onConsentRequest((admin) => {
+      lastAdminName = admin || null;
+      statusEl.innerText = `⚠️ O administrador ${admin} solicitou acesso à sua tela.`;
+      controlsEl.innerHTML = `
+        <div class="row">
+          <button class="accept" id="accept">Aceitar</button>
+          <button class="deny" id="deny">Negar</button>
+        </div>
+        <div class="hint">
+          Ao aceitar, este app NÃO mostra a tela. Ele apenas envia para o Admin Console.
+        </div>
+      `;
+
+      document.getElementById("accept").onclick = async () => {
+        window.electronAPI.sendConsentResponse(true);
 
         controlsEl.innerHTML = "";
-        document.body.appendChild(video);
+        statusEl.innerText = `✅ Permissão concedida${lastAdminName ? " para " + lastAdminName : ""}. Iniciando envio...`;
 
-        statusEl.innerText = `🔓 Compartilhando a tela (${sourceName})...`;
+        try {
+          await startSendingFrames();
+        } catch (e) {
+          console.error(e);
+          statusEl.innerText = "❌ Falha ao iniciar envio da tela.";
+        }
+      };
 
-        window.electronAPI.reportScreenShareStatus?.({
-          ok: true,
-          sourceName
-        });
-      } catch (err) {
-        console.error(err);
-        statusEl.innerText = "❌ Erro ao iniciar compartilhamento.";
-        window.electronAPI.reportScreenShareStatus?.({
-          ok: false,
-          error: err?.message || String(err),
-        });
-      }
+      document.getElementById("deny").onclick = () => {
+        window.electronAPI.sendConsentResponse(false);
+        stopSendingFrames();
+        controlsEl.innerHTML = "";
+        statusEl.innerText = "⛔ Acesso negado.";
+      };
     });
 
     loadConfig();
   </script>
 </body>
-
 </html>

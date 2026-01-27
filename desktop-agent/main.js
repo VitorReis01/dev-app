@@ -1,236 +1,214 @@
-// main.js
-const { app, BrowserWindow, ipcMain } = require("electron");
-const path = require("path");
+"use strict";
+
+/**
+ * Lookout Desktop Agent – PRODUÇÃO
+ *
+ * ✔ DeviceId automático (UUID persistido)
+ * ✔ Zero input do usuário
+ * ✔ Multi-PC garantido
+ * ✔ WebSocket com heartbeat
+ * ✔ Reconexão automática
+ * ✔ Pronto para escala LAN
+ */
+
+const { app, BrowserWindow, dialog, desktopCapturer } = require("electron");
 const WebSocket = require("ws");
+const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 
-let mainWindow;
-let ws;
-let reconnectTimer = null;
-let lastAdmin = null;
+// ============================
+// CONFIG FIXA
+// ============================
 
-// =======================
-// CONFIG FILE
-// =======================
-function getConfigPath() {
-  return path.join(app.getPath("userData"), "agent-config.json");
-}
+const BACKEND_HOST = "192.168.1.101";
+const BACKEND_PORT = 3001;
+const AGENT_VERSION = "1.0.4";
 
-function readConfigSafe() {
-  const configPath = getConfigPath();
-  if (!fs.existsSync(configPath)) return null;
+// ============================
+// DEVICE ID PERSISTENTE
+// ============================
 
+const DATA_DIR = app.getPath("userData");
+const CONFIG_PATH = path.join(DATA_DIR, "agent-config.json");
+
+function getOrCreateDeviceId() {
   try {
-    const raw = fs.readFileSync(configPath, "utf8");
-    const cfg = JSON.parse(raw);
-
-    if (!cfg?.url || !cfg?.deviceId || !cfg?.token) return null;
-    return cfg;
-  } catch {
-    return null;
-  }
-}
-
-function writeConfig(cfg) {
-  const configDir = app.getPath("userData");
-  const configPath = getConfigPath();
-
-  if (!fs.existsSync(configDir)) fs.mkdirSync(configDir, { recursive: true });
-
-  fs.writeFileSync(
-    configPath,
-    JSON.stringify(
-      {
-        url: String(cfg.url || "").trim(),
-        deviceId: String(cfg.deviceId || "").trim(),
-        token: String(cfg.token || "").trim(),
-      },
-      null,
-      2
-    ),
-    "utf8"
-  );
-}
-
-// =======================
-// WINDOW
-// =======================
-function createWindow() {
-  mainWindow = new BrowserWindow({
-    width: 520,
-    height: 520,
-    resizable: false,
-    webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
-      contextIsolation: true,
-      sandbox: false,
-      nodeIntegration: false,
-      devTools: true,
-      backgroundThrottling: false,
-    },
-  });
-
-  mainWindow.loadFile("index.html");
-
-  mainWindow.on("closed", () => {
-    mainWindow = null;
-  });
-}
-
-// =======================
-// WS CONNECTION
-// =======================
-function buildWsUrl(baseUrl, deviceId, token) {
-  const cleanBase = String(baseUrl || "").replace(/\/+$/, "");
-  const params = new URLSearchParams({
-    role: "agent",
-    deviceId,
-    token,
-  });
-  return `${cleanBase}/?${params.toString()}`;
-}
-
-function scheduleReconnect() {
-  if (reconnectTimer) return;
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connectWS();
-  }, 5000);
-}
-
-function closeWS() {
-  try {
-    if (ws) {
-      ws.removeAllListeners();
-      ws.close();
-      ws = null;
+    if (fs.existsSync(CONFIG_PATH)) {
+      const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+      if (cfg.deviceId) return cfg.deviceId;
     }
   } catch {}
-}
 
-function connectWS() {
-  const cfg = readConfigSafe();
-
-  // Se não tem config, não conecta
-  if (!cfg) {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("need-config");
-    }
-    return;
-  }
-
-  const url = buildWsUrl(cfg.url, cfg.deviceId, cfg.token);
-  console.log("[desktop-agent] Conectando em:", url);
+  const deviceId = "device-" + crypto.randomUUID();
+  const cfg = { deviceId, createdAt: new Date().toISOString() };
 
   try {
-    ws = new WebSocket(url);
-  } catch (e) {
-    console.error("⚠️ Erro ao criar WS:", e.message);
-    scheduleReconnect();
-    return;
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+  } catch {}
+
+  return deviceId;
+}
+
+const DEVICE_ID = getOrCreateDeviceId();
+
+// ============================
+// UI (mínima, debug)
+// ============================
+
+let mainWindow = null;
+
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 420,
+    height: 220,
+    resizable: false,
+    show: true,
+    webPreferences: {
+      contextIsolation: true
+    }
+  });
+
+  const html = `
+    <html>
+      <body style="font-family:Arial;padding:16px">
+        <h2>Lookout Agent</h2>
+        <div>Device ID: <b>${DEVICE_ID}</b></div>
+        <div>Versão: ${AGENT_VERSION}</div>
+        <div id="st" style="margin-top:10px;padding:10px;border:1px solid #ccc">
+          Conectando...
+        </div>
+      </body>
+    </html>
+  `;
+
+  mainWindow.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(html));
+}
+
+// ============================
+// WEBSOCKET
+// ============================
+
+const HEARTBEAT_MS = 5000;
+let ws = null;
+let heartbeat = null;
+let reconnectTimer = null;
+
+function wsUrl() {
+  return `ws://${BACKEND_HOST}:${BACKEND_PORT}/?role=agent&deviceId=${encodeURIComponent(
+    DEVICE_ID
+  )}&v=${AGENT_VERSION}&token=agent`;
+}
+
+function startHeartbeat() {
+  stopHeartbeat();
+  heartbeat = setInterval(() => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "ping" }));
+    }
+  }, HEARTBEAT_MS);
+}
+
+function stopHeartbeat() {
+  if (heartbeat) clearInterval(heartbeat);
+  heartbeat = null;
+}
+
+function connectWs() {
+  if (ws) {
+    try { ws.close(); } catch {}
   }
 
+  ws = new WebSocket(wsUrl());
+
   ws.on("open", () => {
-    console.log("✅ Conectado ao servidor WebSocket");
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("ws-connected");
-    }
+    startHeartbeat();
+    mainWindow?.setTitle("Lookout Agent - conectado");
   });
 
-  ws.on("message", (data) => {
+  ws.on("message", async (raw) => {
     let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch {
-      return;
-    }
-    if (!msg || typeof msg !== "object") return;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+
+    if (msg.type === "pong") return;
 
     if (msg.type === "consent_request") {
-      lastAdmin = msg.admin || null;
-      console.log("[desktop-agent] consent_request recebido. admin=", lastAdmin);
-      mainWindow?.webContents?.send("consent-request", lastAdmin);
-    }
+      const res = await dialog.showMessageBox({
+        type: "question",
+        buttons: ["Permitir", "Recusar"],
+        defaultId: 0,
+        cancelId: 1,
+        title: "Pedido de Suporte",
+        message: `Administrador "${msg.admin}" solicitou acesso remoto.`
+      });
 
-    if (msg.type === "admin_connected") {
-      lastAdmin = msg.admin || lastAdmin;
-      console.log("[desktop-agent] admin_connected:", lastAdmin);
-      mainWindow?.webContents?.send("admin-connected", lastAdmin);
+      ws.send(JSON.stringify({
+        type: "consent_response",
+        accepted: res.response === 0
+      }));
+
+      if (res.response === 0) startStreaming();
+      else stopStreaming();
     }
   });
 
-  ws.on("close", (code) => {
-    console.log(`🔌 Conexão perdida (code=${code}). Tentando reconectar em 5s...`);
-    scheduleReconnect();
-  });
-
-  ws.on("error", (err) => {
-    console.error("⚠️ Erro WS:", err.message);
-    scheduleReconnect();
+  ws.on("close", () => {
+    stopHeartbeat();
+    stopStreaming();
+    mainWindow?.setTitle("Lookout Agent - desconectado");
+    reconnectTimer = setTimeout(connectWs, 2000);
   });
 }
 
-// =======================
-// IPC - config + consent + status
-// =======================
-ipcMain.handle("get-config", async () => {
-  return readConfigSafe(); // pode retornar null
-});
+// ============================
+// SCREEN STREAM
+// ============================
 
-ipcMain.handle("save-config", async (_event, cfg) => {
-  // validação mínima
-  const url = String(cfg?.url || "").trim();
-  const deviceId = String(cfg?.deviceId || "").trim();
-  const token = String(cfg?.token || "").trim();
+let streaming = false;
 
-  if (!url || !deviceId || !token) {
-    return { ok: false, error: "Preencha URL, Device ID e Token." };
-  }
+async function sendFrame() {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !streaming) return;
 
-  writeConfig({ url, deviceId, token });
+  const sources = await desktopCapturer.getSources({
+    types: ["screen"],
+    thumbnailSize: { width: 1280, height: 720 }
+  });
 
-  // reconecta
-  closeWS();
-  connectWS();
+  if (!sources.length) return;
 
-  return { ok: true };
-});
+  ws.send(JSON.stringify({
+    type: "screen_frame",
+    deviceId: DEVICE_ID,
+    jpeg: sources[0].thumbnail.toDataURL("image/jpeg", 0.6),
+    ts: Date.now()
+  }));
+}
 
-ipcMain.on("consent-response", async (_event, accepted) => {
-  console.log("[desktop-agent] consent-response:", accepted);
+function startStreaming() {
+  if (streaming) return;
+  streaming = true;
 
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(
-      JSON.stringify({
-        type: "consent_response",
-        accepted: !!accepted,
-        admin: lastAdmin || undefined,
-      })
-    );
-  } else {
-    console.warn("[desktop-agent] WS não está OPEN; não consegui enviar consent_response");
-  }
+  const loop = async () => {
+    if (!streaming) return;
+    await sendFrame();
+    setTimeout(loop, 150);
+  };
+  loop();
+}
 
-  if (accepted && mainWindow && !mainWindow.isDestroyed()) {
-    console.log("[desktop-agent] Enviando start-screen-share para o renderer...");
-    mainWindow.webContents.send("start-screen-share", { ts: Date.now() });
-  }
-});
+function stopStreaming() {
+  streaming = false;
+}
 
-ipcMain.on("screen-share-status", (_event, payload) => {
-  if (!payload) return;
-  if (payload.ok) console.log("🟢 Screen share OK:", payload);
-  else console.error("🔴 Screen share FAIL:", payload);
-});
-
-// =======================
+// ============================
 // APP
-// =======================
+// ============================
+
 app.whenReady().then(() => {
   createWindow();
-  connectWS();
+  connectWs();
 });
 
-app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") app.quit();
+app.on("window-all-closed", (e) => {
+  e.preventDefault();
 });

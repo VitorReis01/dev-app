@@ -1,32 +1,49 @@
 {
   "name": "lookout-desktop-agent",
-  "version": "1.0.2",
+  "version": "1.0.4",
   "description": "Lookout Desktop Agent",
   "main": "main.js",
+  "author": "Lookout",
+  "license": "MIT",
+
   "scripts": {
     "start": "electron .",
-    "dist:win": "electron-builder --win"
+    "dist": "electron-builder"
   },
+
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+
+  "devDependencies": {
+    "electron": "^28.2.0",
+    "electron-builder": "^24.13.3"
+  },
+
   "build": {
-    "appId": "br.com.imstech.desktopagent",
-    "productName": "Lookout",
-    "artifactName": "Lookout Setup ${version}.${ext}",
+    "appId": "com.lookout.agent",
+    "productName": "Lookout Agent",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "**/*"
+    ],
     "win": {
-      "target": "nsis"
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
-      "createStartMenuShortcut": true,
-      "shortcutName": "Lookout"
+      "createStartMenuShortcut": true
     }
-  },
-  "devDependencies": {
-    "electron": "^40.0.0",
-    "electron-builder": "^26.4.0"
-  },
-  "dependencies": {
-    "ws": "^8.19.0"
   }
 }
