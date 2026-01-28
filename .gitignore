@@ -1,14 +1,15 @@
+# Builds / artifacts
+dist/
+build/
+out/
+*.log
+
+# Electron builder
+desktop-agent/dist/
+desktop-agent/build/
+
 # Node
 node_modules/
 
-# Builds
-dist/
-build/
-win-unpacked/
-out/
-
-# Electron
-*.exe
-
-# VS Code
-.vscode/
+# Env
+.env
