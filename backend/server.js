@@ -6,6 +6,9 @@ const WebSocket = require("ws");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
 
 const app = express();
 const server = http.createServer(app);
@@ -17,36 +20,258 @@ app.use(express.json());
 const JWT_SECRET = "supersecretkey";
 
 // ============================
+// Persistência (data dir)
+// ============================
+const DATA_DIR = path.join(__dirname, "data");
+
+// ============================
+// Persistência (aliases)
+// ============================
+const ALIASES_PATH = path.join(DATA_DIR, "device-aliases.json");
+
+function ensureDataDir() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  } catch { }
+}
+
+function loadJsonSafe(filePath, fallback) {
+  ensureDataDir();
+  try {
+    if (!fs.existsSync(filePath)) return fallback;
+    const raw = fs.readFileSync(filePath, "utf8");
+    const parsed = JSON.parse(raw);
+    return parsed ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function saveJsonSafe(filePath, obj) {
+  ensureDataDir();
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(obj, null, 2));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// { [deviceId]: { label, updatedAt } }
+let deviceAliases = loadJsonSafe(ALIASES_PATH, {});
+
+function getAliasLabel(deviceId) {
+  const entry = deviceAliases[String(deviceId || "").trim()];
+  const label = entry?.label ? String(entry.label).trim() : "";
+  return label || "";
+}
+
+// ============================
+// Persistência (compliance events)
+// ============================
+// ✅ Persistimos todos os eventos aqui (MVP produção LAN)
+const COMPLIANCE_EVENTS_PATH = path.join(DATA_DIR, "compliance-events.json");
+
+// [{ id, deviceId, alias, author, context, timestamp, content, matches, severity }]
+let complianceEvents = loadJsonSafe(COMPLIANCE_EVENTS_PATH, []);
+if (!Array.isArray(complianceEvents)) complianceEvents = [];
+
+// ✅ Agregado por device (para alimentar ❗)
+const complianceByDevice = new Map(); // deviceId -> { count, lastAt, lastSeverity }
+
+function recomputeComplianceAgg() {
+  complianceByDevice.clear();
+  for (const ev of complianceEvents) {
+    const deviceId = String(ev?.deviceId || "").trim();
+    if (!deviceId) continue;
+
+    const prev = complianceByDevice.get(deviceId) || {
+      count: 0,
+      lastAt: 0,
+      lastSeverity: null,
+    };
+
+    const ts = Number(ev?.timestamp || 0);
+    prev.count += 1;
+    if (ts >= prev.lastAt) {
+      prev.lastAt = ts;
+      prev.lastSeverity = ev?.severity ?? prev.lastSeverity;
+    }
+
+    complianceByDevice.set(deviceId, prev);
+  }
+}
+recomputeComplianceAgg();
+
+function getComplianceState(deviceId) {
+  const id = String(deviceId || "").trim();
+  const agg = complianceByDevice.get(id);
+  if (!agg) {
+    return {
+      complianceFlag: false,
+      complianceCount: 0,
+      complianceLastAt: null,
+      complianceLastSeverity: null,
+    };
+  }
+  return {
+    complianceFlag: agg.count > 0,
+    complianceCount: agg.count,
+    complianceLastAt: agg.lastAt || null,
+    complianceLastSeverity: agg.lastSeverity || null,
+  };
+}
+
+// ============================
+// Compliance detector (MVP)
+// ============================
+// ✅ normalização para pegar variações (caps, símbolos, números, etc.)
+function normalizeText(s) {
+  const raw = String(s || "");
+  const lower = raw.toLowerCase();
+
+  // remove acentos
+  const noAcc = lower.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
+  // troca leetspeak e símbolos comuns
+  const leet = noAcc
+    .replace(/@/g, "a")
+    .replace(/\$/g, "s")
+    .replace(/0/g, "o")
+    .replace(/1/g, "i")
+    .replace(/3/g, "e")
+    .replace(/4/g, "a")
+    .replace(/5/g, "s")
+    .replace(/7/g, "t");
+
+  // remove pontuação/símbolos (mantém espaço)
+  const cleaned = leet.replace(/[^a-z0-9\s]/g, " ");
+
+  // colapsa espaços
+  return cleaned.replace(/\s+/g, " ").trim();
+}
+
+// ✅ listas principais (você pode expandir depois sem mudar lógica)
+const COMPLIANCE_TRIGGERS = [
+  // 💰 por fora / pagamento direto
+  "pode mandar o valor direto pra mim",
+  "manda pra minha conta",
+  "acerta por fora",
+  "acerta isso por fora",
+  "faz o pix nesse outro numero",
+  "nao precisa passar pela empresa",
+  "esse valor nao precisa ir na nota",
+  "sem envolver o financeiro",
+  "esse pagamento nao precisa aparecer",
+  "isso nao entra no caixa da empresa",
+  "comissao por fora",
+  "parte pra mim",
+  "fica uma parte pra mim",
+  "a diferenca e minha",
+  "esse dinheiro nao aparece",
+
+  // 🧾 nota/sistema
+  "nao lanca isso agora",
+  "melhor nao colocar no sistema",
+  "coloca outro valor na nota",
+  "nao precisa gerar nf",
+  "nao registra isso",
+  "fora do sistema",
+  "sem nota",
+
+  // 🤝 conluio
+  "fica so entre nos",
+  "a empresa nao precisa saber",
+  "nao comenta isso com ninguem",
+  "isso e um acordo nosso",
+
+  // 🤬 palavrões / ofensas (amostra MVP)
+  "porra",
+  "caralho",
+  "merda",
+  "bosta",
+  "foda se",
+  "vai tomar no cu",
+  "vai se foder",
+  "fdp",
+  "filho da puta",
+  "arrombado",
+  "babaca",
+  "idiota",
+  "imbecil",
+  "otario",
+  "trouxa",
+  "pqp",
+  "vtnc",
+];
+
+function detectCompliance(content) {
+  const norm = normalizeText(content);
+
+  const matches = [];
+  for (const t of COMPLIANCE_TRIGGERS) {
+    const nt = normalizeText(t);
+    if (!nt) continue;
+    if (norm.includes(nt)) matches.push(t);
+  }
+
+  if (matches.length === 0) {
+    return { suspicious: false, matches: [], severity: null };
+  }
+
+  // ✅ severidade MVP
+  // high: por fora / dinheiro / comissão / dividir / pix
+  // medium: sistema/nota
+  // low: palavrão/ofensa
+  const normJoined = matches.map((m) => normalizeText(m)).join(" | ");
+  let severity = "low";
+
+  if (
+    normJoined.includes("por fora") ||
+    normJoined.includes("pix") ||
+    normJoined.includes("dinheiro") ||
+    normJoined.includes("comissao") ||
+    normJoined.includes("parte pra mim") ||
+    normJoined.includes("a diferenca e minha")
+  ) {
+    severity = "high";
+  } else if (
+    normJoined.includes("nota") ||
+    normJoined.includes("sistema") ||
+    normJoined.includes("nf") ||
+    normJoined.includes("nao registra") ||
+    normJoined.includes("fora do sistema")
+  ) {
+    severity = "medium";
+  }
+
+  return { suspicious: true, matches, severity };
+}
+
+// ============================
 // In-memory data (MVP)
 // ============================
 const adminsSeed = [
   { id: 1, username: "admin", passwordHash: bcrypt.hashSync("admin123", 10) },
 ];
 
-// ✅ Devices em memória (agora com auto-register)
-// Campo canônico: connected (bool)
-// Campo compat front: online (alias em REST)
-const devices = [
-  { id: "device1", name: "PC do João", user: "João", connected: false },
-  { id: "device2", name: "Device 2", user: "User 2", connected: false },
-  // Você pode manter esse aqui ou remover: com auto-register não é obrigatório
-  { id: "device-user01", name: "User 01", user: "User01", connected: false },
-];
+// ✅ Devices começam vazios (sem seed de teste)
+const devices = [];
 
+// logs (MVP)
 const logs = [];
 
 // WS sessions
 const wsAgentsByDeviceId = new Map(); // deviceId -> ws
-// last frame por dispositivo (dataURL jpeg)
 const lastFrameByDevice = {}; // { [deviceId]: "data:image/jpeg;base64,..." }
 
 // throttle por device
 const lastFrameSentAtByDevice = {}; // { [deviceId]: number(ms) }
-const MIN_FRAME_INTERVAL_MS = 120; // ~8 fps
+const MIN_FRAME_INTERVAL_MS = 120;
 
 // Presence TTL (anti-zumbi)
 const PRESENCE_TTL_MS = 15_000;
-const HEARTBEAT_TYPE = "ping"; // msg.type esperado do agent (JSON)
+const HEARTBEAT_TYPE = "ping";
 
 // ============================
 // Helpers
@@ -64,14 +289,23 @@ function findDevice(deviceId) {
 }
 
 function toDeviceDTO(d) {
+  const alias = getAliasLabel(d.id);
+  const comp = getComplianceState(d.id);
+
   return {
     id: d.id,
-    name: d.name,
-    user: d.user,
+    name: alias || d.name, // ✅ aplica alias no REST
+    user: d.user, // pode manter "unknown" (UI ignora)
     connected: !!d.connected,
-    online: !!d.connected, // alias para front
+    online: !!d.connected,
     lastSeen: d.lastSeen,
     agentVersion: d.agentVersion,
+
+    // ✅ compliance fields para ❗
+    complianceFlag: comp.complianceFlag,
+    complianceCount: comp.complianceCount,
+    complianceLastAt: comp.complianceLastAt,
+    complianceLastSeverity: comp.complianceLastSeverity,
   };
 }
 
@@ -133,12 +367,101 @@ function authenticateAdmin(req, res, next) {
 // REST
 // ============================
 app.get("/api/devices", authenticateAdmin, (req, res) => {
-  // retorna DTO com alias online
   res.json(devices.map(toDeviceDTO));
 });
 
 app.get("/api/logs", authenticateAdmin, (req, res) => {
   res.json(logs);
+});
+
+// ✅ ALIASES
+app.get("/api/device-aliases", authenticateAdmin, (req, res) => {
+  res.json(deviceAliases);
+});
+
+app.put("/api/device-aliases/:deviceId", authenticateAdmin, (req, res) => {
+  const deviceId = normDeviceId(req.params.deviceId);
+  if (!deviceId) return res.status(400).json({ error: "deviceId inválido" });
+
+  const label = String(req.body?.label ?? "").trim();
+
+  // label vazio => remove alias
+  if (!label) {
+    if (deviceAliases[deviceId]) {
+      delete deviceAliases[deviceId];
+      const okRemove = saveJsonSafe(ALIASES_PATH, deviceAliases);
+      if (!okRemove) return res.status(500).json({ error: "Falha ao persistir alias" });
+    }
+    return res.json({ ok: true, deviceId, label: "" });
+  }
+
+  deviceAliases[deviceId] = {
+    label,
+    updatedAt: nowMs(),
+  };
+
+  const ok = saveJsonSafe(ALIASES_PATH, deviceAliases);
+  if (!ok) return res.status(500).json({ error: "Falha ao persistir alias" });
+
+  res.json({ ok: true, deviceId, label });
+});
+
+// ✅ COMPLIANCE: listar eventos (com filtro por deviceId)
+app.get("/api/compliance/events", authenticateAdmin, (req, res) => {
+  const deviceId = normDeviceId(req.query?.deviceId);
+  const list = deviceId ? complianceEvents.filter((e) => e.deviceId === deviceId) : complianceEvents;
+  res.json(list);
+});
+
+// ✅ COMPLIANCE: criar evento (manual/teste e integração futura do agent)
+app.post("/api/compliance/events", authenticateAdmin, (req, res) => {
+  const deviceId = normDeviceId(req.body?.deviceId);
+  const context = String(req.body?.context ?? "").trim();
+  const content = String(req.body?.content ?? "").trim();
+  const author = String(req.admin?.username ?? "admin").trim();
+
+  if (!deviceId) return res.status(400).json({ error: "deviceId obrigatório" });
+  if (!content) return res.status(400).json({ error: "content obrigatório" });
+
+  const { suspicious, matches, severity } = detectCompliance(content);
+
+  // ✅ sempre registra (auditoria), mas marca suspeito quando bater
+  const ev = {
+    id: `cev_${nowMs()}_${crypto.randomBytes(8).toString("hex")}`,
+    deviceId,
+    alias: getAliasLabel(deviceId) || null,
+    author,
+    context: context || null,
+    timestamp: nowMs(),
+    content,
+    matches,
+    severity: suspicious ? severity : null,
+    suspicious: !!suspicious,
+  };
+
+  complianceEvents.push(ev);
+  const ok = saveJsonSafe(COMPLIANCE_EVENTS_PATH, complianceEvents);
+  if (!ok) return res.status(500).json({ error: "Falha ao persistir compliance event" });
+
+  if (suspicious) {
+    // ✅ atualiza agregado do device
+    const prev = complianceByDevice.get(deviceId) || { count: 0, lastAt: 0, lastSeverity: null };
+    prev.count += 1;
+    prev.lastAt = ev.timestamp;
+    prev.lastSeverity = ev.severity;
+    complianceByDevice.set(deviceId, prev);
+
+    // ✅ avisa admins em realtime para subir o ❗ sem F5
+    broadcastToAdmins({
+      type: "compliance_event",
+      deviceId,
+      count: prev.count,
+      severity: ev.severity,
+      ts: ev.timestamp,
+    });
+  }
+
+  return res.json({ ok: true, suspicious, event: ev });
 });
 
 // endpoint HTTP pra buscar a tela (fallback / debug)
@@ -175,24 +498,35 @@ function verifyAdminToken(token) {
 function sendDevicesSnapshot(ws) {
   safeSend(ws, {
     type: "devices_snapshot",
-    devices: devices.map((d) => ({
-      deviceId: d.id,
-      online: !!d.connected,
-      connected: !!d.connected,
-      lastSeen: d.lastSeen,
-      agentVersion: d.agentVersion,
-    })),
+    devices: devices.map((d) => {
+      const alias = getAliasLabel(d.id);
+      const comp = getComplianceState(d.id);
+
+      return {
+        deviceId: d.id,
+        name: alias || d.name,
+        online: !!d.connected,
+        connected: !!d.connected,
+        lastSeen: d.lastSeen,
+        agentVersion: d.agentVersion,
+
+        // ✅ compliance fields para UI
+        complianceFlag: comp.complianceFlag,
+        complianceCount: comp.complianceCount,
+        complianceLastAt: comp.complianceLastAt,
+        complianceLastSeverity: comp.complianceLastSeverity,
+      };
+    }),
     ts: nowMs(),
   });
 }
 
 function handleAgent(ws, deviceId, params) {
-  // ✅ AUTO-REGISTER: se o device não existir, cria na hora
   let d = findDevice(deviceId);
   if (!d) {
     d = {
       id: deviceId,
-      name: deviceId,
+      name: deviceId, // base
       user: "unknown",
       connected: false,
       lastSeen: null,
@@ -202,7 +536,6 @@ function handleAgent(ws, deviceId, params) {
     console.log(`🆕 Registrando novo dispositivo automaticamente: ${deviceId}`);
   }
 
-  // meta: versão do agent (opcional por query ?v=1.0.3)
   const agentVersion = params.get("v") || null;
 
   d.connected = true;
@@ -215,8 +548,6 @@ function handleAgent(ws, deviceId, params) {
   ws.deviceId = deviceId;
 
   console.log(`✅ Dispositivo ${deviceId} conectado (agent)`);
-
-  // avisa admins imediatamente
   emitPresence(deviceId, true, d);
 
   ws.on("message", (msg) => {
@@ -227,7 +558,6 @@ function handleAgent(ws, deviceId, params) {
       return;
     }
 
-    // Heartbeat do agent (presença)
     if (data?.type === HEARTBEAT_TYPE) {
       const dev = findDevice(deviceId);
       if (dev) dev.lastSeen = nowMs();
@@ -235,7 +565,6 @@ function handleAgent(ws, deviceId, params) {
       return;
     }
 
-    // ✅ CONSENT
     if (data.type === "consent_response") {
       logs.push({
         deviceId,
@@ -253,15 +582,12 @@ function handleAgent(ws, deviceId, params) {
       return;
     }
 
-    // ✅ REALTIME: FRAME -> salva e repassa pros ADMINS
     if (data.type === "screen_frame") {
       if (data.deviceId && typeof data.jpeg === "string") {
         const fid = normDeviceId(data.deviceId);
 
-        // salva último frame (para endpoint HTTP)
         lastFrameByDevice[fid] = data.jpeg;
 
-        // throttle por device
         const now = nowMs();
         const last = lastFrameSentAtByDevice[fid] || 0;
         if (now - last < MIN_FRAME_INTERVAL_MS) return;
@@ -276,6 +602,53 @@ function handleAgent(ws, deviceId, params) {
       }
       return;
     }
+
+    // ✅ FUTURO (texto capturado): agent pode enviar {type:"text_captured", author, context, content}
+    // MVP: se bater em compliance => cria evento e sobe ❗
+    if (data.type === "text_captured" && typeof data.content === "string") {
+      const content = String(data.content || "").trim();
+      if (!content) return;
+
+      const author = String(data.author || "unknown").trim();
+      const context = String(data.context || "agent").trim();
+
+      const { suspicious, matches, severity } = detectCompliance(content);
+
+      const ev = {
+        id: `cev_${nowMs()}_${crypto.randomBytes(8).toString("hex")}`,
+        deviceId,
+        alias: getAliasLabel(deviceId) || null,
+        author,
+        context,
+        timestamp: nowMs(),
+        content,
+        matches,
+        severity: suspicious ? severity : null,
+        suspicious: !!suspicious,
+      };
+
+      complianceEvents.push(ev);
+      const ok = saveJsonSafe(COMPLIANCE_EVENTS_PATH, complianceEvents);
+      if (!ok) return;
+
+      if (suspicious) {
+        const prev = complianceByDevice.get(deviceId) || { count: 0, lastAt: 0, lastSeverity: null };
+        prev.count += 1;
+        prev.lastAt = ev.timestamp;
+        prev.lastSeverity = ev.severity;
+        complianceByDevice.set(deviceId, prev);
+
+        broadcastToAdmins({
+          type: "compliance_event",
+          deviceId,
+          count: prev.count,
+          severity: ev.severity,
+          ts: ev.timestamp,
+        });
+      }
+
+      return;
+    }
   });
 
   ws.on("close", (code) => {
@@ -288,7 +661,6 @@ function handleAgent(ws, deviceId, params) {
     if (dev) dev.connected = false;
 
     console.log(`🔌 Dispositivo ${deviceId} desconectado (code=${code})`);
-
     if (dev) emitPresence(deviceId, false, dev);
   });
 
@@ -310,8 +682,6 @@ function handleAdmin(ws, token) {
   ws.adminUser = decoded.username;
 
   console.log(`✅ Admin ${decoded.username} conectado`);
-
-  // snapshot inicial
   sendDevicesSnapshot(ws);
 
   ws.on("message", (msg) => {
@@ -339,10 +709,7 @@ function handleAdmin(ws, token) {
           admin: decoded.username,
         });
       } else {
-        safeSend(ws, {
-          type: "error",
-          message: "Dispositivo offline",
-        });
+        safeSend(ws, { type: "error", message: "Dispositivo offline" });
       }
       return;
     }
@@ -351,12 +718,7 @@ function handleAdmin(ws, token) {
       const id = normDeviceId(data.deviceId);
       const jpeg = lastFrameByDevice[id];
       if (jpeg) {
-        safeSend(ws, {
-          type: "screen_frame",
-          deviceId: id,
-          jpeg,
-          ts: nowMs(),
-        });
+        safeSend(ws, { type: "screen_frame", deviceId: id, jpeg, ts: nowMs() });
       }
       return;
     }
@@ -374,10 +736,10 @@ function handleAdmin(ws, token) {
 wss.on("connection", (ws, req) => {
   const params = parseQuery(req.url);
 
-  const role = params.get("role");             // "agent" | "admin"
-  const deviceIdRaw = params.get("deviceId");  // ex: "device2"
-  const token = params.get("token");           // padrão novo
-  const adminToken = params.get("adminToken"); // compat antiga
+  const role = params.get("role");
+  const deviceIdRaw = params.get("deviceId");
+  const token = params.get("token");
+  const adminToken = params.get("adminToken");
   const effectiveAdminToken = adminToken || token;
 
   const deviceId = normDeviceId(deviceIdRaw);
@@ -389,19 +751,16 @@ wss.on("connection", (ws, req) => {
     hasAdminToken: !!adminToken,
   });
 
-  // ========== AGENT ==========
   if (role === "agent") {
     if (!deviceId) return ws.close(1008, "deviceId required");
     return handleAgent(ws, deviceId, params);
   }
 
-  // ========== ADMIN ==========
   if (role === "admin") {
     if (!effectiveAdminToken) return ws.close(1008, "admin token required");
     return handleAdmin(ws, effectiveAdminToken);
   }
 
-  // ========== FALLBACK COMPAT ==========
   if (deviceId) {
     console.log(`ℹ️ Conexão compat detectada. Tratando como agent: ${deviceId}`);
     return handleAgent(ws, deviceId, params);
@@ -430,7 +789,7 @@ setInterval(() => {
     const ws = wsAgentsByDeviceId.get(d.id);
     try {
       if (ws && ws.readyState !== WebSocket.CLOSED) ws.terminate();
-    } catch {}
+    } catch { }
 
     wsAgentsByDeviceId.delete(d.id);
     d.connected = false;

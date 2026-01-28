@@ -1,6 +1,6 @@
 {
   "name": "lookout-desktop-agent",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Lookout Desktop Agent",
   "main": "main.js",
   "author": "Lookout",

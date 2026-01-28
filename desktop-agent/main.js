@@ -3,11 +3,12 @@
 /**
  * Lookout Desktop Agent – PRODUÇÃO
  *
- * ✔ DeviceId automático (UUID persistido)
+ * ✔ DeviceId automático (UUID persistido)  [AGORA GLOBAL POR MÁQUINA]
  * ✔ Zero input do usuário
  * ✔ Multi-PC garantido
  * ✔ WebSocket com heartbeat
  * ✔ Reconexão automática
+ * ✔ Anti-múltiplas sessões RDP (LOCK GLOBAL)
  * ✔ Pronto para escala LAN
  */
 
@@ -23,16 +24,107 @@ const crypto = require("crypto");
 
 const BACKEND_HOST = "192.168.1.101";
 const BACKEND_PORT = 3001;
-const AGENT_VERSION = "1.0.4";
+const AGENT_VERSION = "1.0.5";
 
 // ============================
-// DEVICE ID PERSISTENTE
+// STORAGE GLOBAL (POR MÁQUINA)
+// ============================
+// Importante: userData é por usuário/sessão. Em RDP vira caos.
+// ProgramData é por máquina e acessível em todas as sessões.
+const PROGRAM_DATA = process.env.ProgramData || "C:\\ProgramData";
+const BASE_DIR = path.join(PROGRAM_DATA, "LOOKOUT");
+const CONFIG_PATH = path.join(BASE_DIR, "agent-config.json");
+const LOCK_PATH = path.join(BASE_DIR, "agent.lock");
+
+function ensureBaseDir() {
+  try {
+    fs.mkdirSync(BASE_DIR, { recursive: true });
+  } catch {}
+}
+
+// ============================
+// LOCK GLOBAL (ANTI-RDP MULTI-SESSION)
 // ============================
 
-const DATA_DIR = app.getPath("userData");
-const CONFIG_PATH = path.join(DATA_DIR, "agent-config.json");
+function processExists(pid) {
+  if (!pid || typeof pid !== "number") return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function tryAcquireGlobalLock() {
+  ensureBaseDir();
+
+  // 1) Se existe lock, tenta entender se é órfão (crash)
+  if (fs.existsSync(LOCK_PATH)) {
+    try {
+      const raw = fs.readFileSync(LOCK_PATH, "utf8");
+      const info = JSON.parse(raw);
+      const ownerPid = Number(info?.pid);
+
+      // Se o PID ainda existe, bloqueia (outro agent já é o dono)
+      if (processExists(ownerPid)) {
+        return { ok: false, reason: "lock_exists", owner: info };
+      }
+
+      // Se não existe, lock órfão: remove e tenta adquirir
+      try {
+        fs.unlinkSync(LOCK_PATH);
+      } catch {}
+    } catch {
+      // Lock corrompido: tenta remover
+      try {
+        fs.unlinkSync(LOCK_PATH);
+      } catch {}
+    }
+  }
+
+  // 2) Cria lock exclusivo
+  try {
+    const fd = fs.openSync(LOCK_PATH, "wx"); // falha se já existir
+    const owner = {
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      version: AGENT_VERSION,
+      session: process.env.SESSIONNAME || null,
+      username: process.env.USERNAME || null
+    };
+    fs.writeFileSync(fd, JSON.stringify(owner, null, 2));
+    fs.closeSync(fd);
+    return { ok: true, owner };
+  } catch {
+    // Se alguém criou entre o check e o openSync
+    try {
+      const raw = fs.readFileSync(LOCK_PATH, "utf8");
+      return { ok: false, reason: "lock_exists", owner: JSON.parse(raw) };
+    } catch {
+      return { ok: false, reason: "lock_exists_unknown", owner: null };
+    }
+  }
+}
+
+function releaseGlobalLock() {
+  try {
+    if (!fs.existsSync(LOCK_PATH)) return;
+    const raw = fs.readFileSync(LOCK_PATH, "utf8");
+    const info = JSON.parse(raw);
+    if (Number(info?.pid) === process.pid) {
+      fs.unlinkSync(LOCK_PATH);
+    }
+  } catch {}
+}
+
+// ============================
+// DEVICE ID PERSISTENTE (GLOBAL)
+// ============================
 
 function getOrCreateDeviceId() {
+  ensureBaseDir();
+
   try {
     if (fs.existsSync(CONFIG_PATH)) {
       const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
@@ -41,7 +133,11 @@ function getOrCreateDeviceId() {
   } catch {}
 
   const deviceId = "device-" + crypto.randomUUID();
-  const cfg = { deviceId, createdAt: new Date().toISOString() };
+  const cfg = {
+    deviceId,
+    createdAt: new Date().toISOString(),
+    version: AGENT_VERSION
+  };
 
   try {
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
@@ -85,6 +181,17 @@ function createWindow() {
   mainWindow.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(html));
 }
 
+function setStatus(text) {
+  try {
+    if (!mainWindow) return;
+    const safe = String(text).replace(/`/g, "\\`");
+    mainWindow.webContents.executeJavaScript(
+      `document.getElementById('st').innerText = \`${safe}\`;`,
+      true
+    );
+  } catch {}
+}
+
 // ============================
 // WEBSOCKET
 // ============================
@@ -114,21 +221,35 @@ function stopHeartbeat() {
   heartbeat = null;
 }
 
+function scheduleReconnect() {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(connectWs, 2000);
+}
+
 function connectWs() {
   if (ws) {
-    try { ws.close(); } catch {}
+    try {
+      ws.removeAllListeners();
+      ws.close();
+    } catch {}
   }
 
+  setStatus("Conectando...");
   ws = new WebSocket(wsUrl());
 
   ws.on("open", () => {
     startHeartbeat();
     mainWindow?.setTitle("Lookout Agent - conectado");
+    setStatus("Conectado ✅");
   });
 
   ws.on("message", async (raw) => {
     let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
 
     if (msg.type === "pong") return;
 
@@ -142,10 +263,12 @@ function connectWs() {
         message: `Administrador "${msg.admin}" solicitou acesso remoto.`
       });
 
-      ws.send(JSON.stringify({
-        type: "consent_response",
-        accepted: res.response === 0
-      }));
+      ws.send(
+        JSON.stringify({
+          type: "consent_response",
+          accepted: res.response === 0
+        })
+      );
 
       if (res.response === 0) startStreaming();
       else stopStreaming();
@@ -156,7 +279,15 @@ function connectWs() {
     stopHeartbeat();
     stopStreaming();
     mainWindow?.setTitle("Lookout Agent - desconectado");
-    reconnectTimer = setTimeout(connectWs, 2000);
+    setStatus("Desconectado. Reconectando...");
+    scheduleReconnect();
+  });
+
+  ws.on("error", () => {
+    // Evita crash por erro de rede
+    try {
+      ws.close();
+    } catch {}
   });
 }
 
@@ -176,12 +307,14 @@ async function sendFrame() {
 
   if (!sources.length) return;
 
-  ws.send(JSON.stringify({
-    type: "screen_frame",
-    deviceId: DEVICE_ID,
-    jpeg: sources[0].thumbnail.toDataURL("image/jpeg", 0.6),
-    ts: Date.now()
-  }));
+  ws.send(
+    JSON.stringify({
+      type: "screen_frame",
+      deviceId: DEVICE_ID,
+      jpeg: sources[0].thumbnail.toDataURL("image/jpeg", 0.6),
+      ts: Date.now()
+    })
+  );
 }
 
 function startStreaming() {
@@ -204,9 +337,38 @@ function stopStreaming() {
 // APP
 // ============================
 
-app.whenReady().then(() => {
+// Também ajuda dentro da mesma sessão/usuário (não resolve RDP sozinho, mas é bônus)
+const gotSingleInstance = app.requestSingleInstanceLock();
+if (!gotSingleInstance) {
+  // Não mostra nada — encerra silencioso
+  try {
+    app.quit();
+  } catch {}
+}
+
+app.whenReady().then(async () => {
+  // 1) LOCK GLOBAL POR MÁQUINA (resolve RDP multi-session)
+  const lock = tryAcquireGlobalLock();
+  if (!lock.ok) {
+    // Não cria janela para não incomodar usuário em outra sessão.
+    // Só encerra silenciosamente.
+    try {
+      app.quit();
+    } catch {}
+    return;
+  }
+
+  // 2) UI + conexão
   createWindow();
   connectWs();
+});
+
+app.on("before-quit", () => {
+  try {
+    stopHeartbeat();
+    stopStreaming();
+  } catch {}
+  releaseGlobalLock();
 });
 
 app.on("window-all-closed", (e) => {

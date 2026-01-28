@@ -4,9 +4,6 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
  * ============================================
  * CONFIG (HTTP + WS)
  * ============================================
- * - Mantém seu modelo atual (HOST/PORT separados)
- * - Permite rodar admin-console em outro PC da rede
- * - Fallbacks seguros para ambiente dev
  */
 const BACKEND_HOST = process.env.REACT_APP_BACKEND_HOST || "localhost";
 const BACKEND_PORT = process.env.REACT_APP_BACKEND_PORT || "3001";
@@ -19,18 +16,14 @@ const WS_BASE = `ws://${BACKEND_HOST}:${BACKEND_PORT}`;
  * UTILIDADES
  * ============================================
  */
-
-/** Normaliza deviceId para evitar mismatch por espaços/case */
 function normId(id) {
   return String(id || "").trim();
 }
 
-/** Decide "online" de forma compatível (backend pode mandar connected e/ou online) */
 function isOnline(device) {
   return !!(device?.connected ?? device?.online);
 }
 
-/** Converte array em map por id (state normalizado) */
 function arrayToMapById(list) {
   const out = {};
   for (const d of list || []) {
@@ -38,30 +31,28 @@ function arrayToMapById(list) {
     if (!id) continue;
 
     out[id] = {
-      // Campos canônicos no front
       id,
       name: d.name ?? out[id]?.name ?? "",
-      user: d.user ?? out[id]?.user ?? "",
       connected: !!(d.connected ?? d.online),
-      online: !!(d.online ?? d.connected), // compat
+      online: !!(d.online ?? d.connected),
       lastSeen: d.lastSeen ?? null,
       agentVersion: d.agentVersion ?? null,
+
+      // ✅ compliance (para ❗)
+      complianceFlag: !!d.complianceFlag,
+      complianceCount: Number(d.complianceCount || 0),
+      complianceLastAt: d.complianceLastAt ?? null,
+      complianceLastSeverity: d.complianceLastSeverity ?? null,
     };
   }
   return out;
 }
 
-/**
- * Aplica patch de presença (device_presence) no map normalizado.
- * - Se o device ainda não existe no map, cria uma entrada mínima (não quebra UI).
- * - Mantém name/user se já existirem.
- */
 function applyPresencePatch(prevById, patch) {
   const deviceId = normId(patch?.deviceId);
   if (!deviceId) return prevById;
 
-  const prev = prevById[deviceId] || { id: deviceId, name: deviceId, user: "" };
-
+  const prev = prevById[deviceId] || { id: deviceId, name: deviceId };
   const connected = !!patch.online;
 
   return {
@@ -72,6 +63,7 @@ function applyPresencePatch(prevById, patch) {
       online: connected,
       lastSeen: patch.lastSeen ?? prev.lastSeen ?? null,
       agentVersion: patch.agentVersion ?? prev.agentVersion ?? null,
+      // ✅ presence não mexe em compliance
     },
   };
 }
@@ -80,17 +72,14 @@ function applyPresencePatch(prevById, patch) {
  * ============================================
  * ScreenViewer
  * ============================================
- * - Mantém seu polling HTTP /frame (~7fps)
- * - Fullscreen com duplo clique
- * - Debug: abrir frame em nova aba
  */
-function ScreenViewer({ deviceId }) {
+function ScreenViewer({ deviceId, displayName }) {
   const [tick, setTick] = useState(0);
   const viewerRef = useRef(null);
 
   useEffect(() => {
     if (!deviceId) return;
-    const t = setInterval(() => setTick((x) => x + 1), 150); // ~7 fps
+    const t = setInterval(() => setTick((x) => x + 1), 150);
     return () => clearInterval(t);
   }, [deviceId]);
 
@@ -120,7 +109,10 @@ function ScreenViewer({ deviceId }) {
   return (
     <div style={{ marginTop: 20 }}>
       <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 10 }}>
-        <h2 style={{ margin: 0 }}>Tela do dispositivo: {deviceId}</h2>
+        <h2 style={{ margin: 0 }}>
+          Tela do dispositivo: {displayName ? displayName : deviceId}{" "}
+          <span style={{ color: "#777", fontSize: 12 }}>({deviceId})</span>
+        </h2>
 
         <button onClick={enterFullscreen}>Tela cheia</button>
         <button onClick={exitFullscreen}>Sair</button>
@@ -163,37 +155,49 @@ function ScreenViewer({ deviceId }) {
  * ============================================
  * App
  * ============================================
- * Estratégia nível produção (MVP):
- * - REST (GET /devices, GET /logs) para snapshot "full"
- * - WebSocket para eventos incrementais:
- *     - devices_snapshot (estado inicial de presença sem polling)
- *     - device_presence (online/offline em tempo real)
- *     - consent_response (seu fluxo atual)
  */
 function App() {
   const [token, setToken] = useState(null);
   const [user, setUser] = useState(null);
 
-  // State normalizado (permite patch incremental sem re-fetch)
   const [devicesById, setDevicesById] = useState({});
   const [logs, setLogs] = useState([]);
 
+  // ✅ Aliases persistidos no backend
+  const [aliasesById, setAliasesById] = useState({});
+
+  // UI rename
+  const [editingDeviceId, setEditingDeviceId] = useState(null);
+  const [editingValue, setEditingValue] = useState("");
+
   const [selectedDeviceId, setSelectedDeviceId] = useState(null);
 
-  // WS ref (não força re-render)
-  const wsRef = useRef(null);
+  // ✅ Compliance UI (painel)
+  const [showCompliance, setShowCompliance] = useState(false);
+  const [complianceEvents, setComplianceEvents] = useState([]);
+  const [complianceFilterDeviceId, setComplianceFilterDeviceId] = useState("");
 
-  // Reconexão leve (evita loop insano em caso de backend offline)
+  const wsRef = useRef(null);
   const reconnectTimerRef = useRef(null);
   const reconnectAttemptsRef = useRef(0);
 
-  /**
-   * devices (array) derivado do map normalizado.
-   * - useMemo evita recalcular a cada render.
-   */
   const devices = useMemo(() => {
     return Object.values(devicesById).sort((a, b) => a.id.localeCompare(b.id));
   }, [devicesById]);
+
+  const getAliasLabel = (deviceId) => {
+    const id = normId(deviceId);
+    const entry = aliasesById[id];
+    const label = entry?.label ? String(entry.label).trim() : "";
+    return label || "";
+  };
+
+  const getDisplayName = (device) => {
+    const id = normId(device?.id);
+    const alias = getAliasLabel(id);
+    if (alias) return alias;
+    return device?.name || id;
+  };
 
   /**
    * ============================================
@@ -219,10 +223,8 @@ function App() {
 
   /**
    * ============================================
-   * REST SNAPSHOT (devices + logs)
+   * REST SNAPSHOT
    * ============================================
-   * - Útil para carregar name/user e garantir consistência
-   * - Presença real-time vem pelo WS
    */
   const fetchDevices = async (authToken) => {
     const headers = { Authorization: `Bearer ${authToken}` };
@@ -230,11 +232,9 @@ function App() {
     if (!res.ok) return;
 
     const list = await res.json();
-    setDevicesById((prev) => {
-      // preserva patches que chegaram via WS e mescla com o snapshot
-      const next = { ...prev, ...arrayToMapById(list) };
-      return next;
-    });
+
+    // ✅ IMPORTANTE: replace total (remove ghosts)
+    setDevicesById(arrayToMapById(list));
   };
 
   const fetchLogs = async (authToken) => {
@@ -244,22 +244,47 @@ function App() {
     setLogs(await res.json());
   };
 
+  const fetchAliases = async (authToken) => {
+    const headers = { Authorization: `Bearer ${authToken}` };
+    const res = await fetch(`${HTTP_BASE}/api/device-aliases`, { headers });
+    if (!res.ok) return;
+
+    const data = await res.json();
+    const normalized = {};
+    for (const [k, v] of Object.entries(data || {})) {
+      const id = normId(k);
+      if (!id) continue;
+
+      if (typeof v === "string") {
+        normalized[id] = { label: v, updatedAt: null };
+      } else {
+        normalized[id] = {
+          label: typeof v?.label === "string" ? v.label : "",
+          updatedAt: v?.updatedAt ?? null,
+        };
+      }
+    }
+    setAliasesById(normalized);
+  };
+
+  // ✅ Compliance events
+  const fetchComplianceEvents = async (authToken, deviceIdFilter) => {
+    const headers = { Authorization: `Bearer ${authToken}` };
+    const q = deviceIdFilter ? `?deviceId=${encodeURIComponent(deviceIdFilter)}` : "";
+    const res = await fetch(`${HTTP_BASE}/api/compliance/events${q}`, { headers });
+    if (!res.ok) return;
+    setComplianceEvents(await res.json());
+  };
+
   const fetchData = async (authToken) => {
     if (!authToken) return;
-    await Promise.all([fetchDevices(authToken), fetchLogs(authToken)]);
+    await Promise.all([fetchDevices(authToken), fetchLogs(authToken), fetchAliases(authToken)]);
   };
 
   /**
    * ============================================
    * WS ADMIN (realtime)
    * ============================================
-   * - Conecta com token JWT
-   * - Recebe:
-   *    - devices_snapshot: presença inicial imediata
-   *    - device_presence: delta por device
-   *    - consent_response: fluxo atual
-   *
-   * NOTA: seu backend aceita token em "token" e também "adminToken".
    */
   useEffect(() => {
     if (!token) return;
@@ -281,8 +306,6 @@ function App() {
       if (closedByCleanup) return;
 
       reconnectAttemptsRef.current += 1;
-
-      // backoff simples: 0.8s, 1.2s, 2s, 3s, 5s...
       const attempt = reconnectAttemptsRef.current;
       const delay = Math.min(5000, 600 + attempt * 400);
 
@@ -294,15 +317,11 @@ function App() {
     const connectWs = () => {
       cleanupWs();
 
-      // ws admin com token JWT
       const ws = new WebSocket(`${WS_BASE}/?role=admin&token=${encodeURIComponent(token)}`);
       wsRef.current = ws;
 
       ws.onopen = async () => {
         reconnectAttemptsRef.current = 0;
-
-        // Carrega snapshot "full" via REST (name/user etc.)
-        // (presença em tempo real vem do WS)
         await fetchData(token);
       };
 
@@ -314,44 +333,19 @@ function App() {
           return;
         }
 
-        // 1) Snapshot inicial de presença
         if (msg.type === "devices_snapshot" && Array.isArray(msg.devices)) {
-          // msg.devices: [{ deviceId, online, lastSeen, agentVersion, ... }]
-          setDevicesById((prev) => {
-            const next = { ...prev };
-
-            for (const item of msg.devices) {
-              const id = normId(item.deviceId ?? item.id);
-              if (!id) continue;
-
-              const prevDev = next[id] || { id, name: id, user: "" };
-              const connected = !!(item.connected ?? item.online);
-
-              next[id] = {
-                ...prevDev,
-                connected,
-                online: connected,
-                lastSeen: item.lastSeen ?? prevDev.lastSeen ?? null,
-                agentVersion: item.agentVersion ?? prevDev.agentVersion ?? null,
-              };
-            }
-
-            return next;
-          });
-
+          // ✅ IMPORTANTE: replace total (remove ghosts)
+          setDevicesById(arrayToMapById(msg.devices));
           return;
         }
 
-        // 2) Delta de presença em tempo real
         if (msg.type === "device_presence") {
           setDevicesById((prev) => applyPresencePatch(prev, msg));
           return;
         }
 
-        // 3) Seu fluxo atual de consentimento
         if (msg.type === "consent_response") {
           alert(`Dispositivo ${msg.deviceId} ${msg.accepted ? "aceitou" : "recusou"} o suporte.`);
-          // Logs podem ter mudado
           fetchLogs(token);
 
           if (msg.accepted) {
@@ -360,17 +354,33 @@ function App() {
           return;
         }
 
-        // Opcional (se você quiser consumir frames via WS no futuro):
-        // if (msg.type === "screen_frame") { ... }
+        // ✅ Realtime: evento SUSPEITO => liga o ❗ já
+        if (msg.type === "compliance_event" && msg.deviceId) {
+          const id = normId(msg.deviceId);
+          setDevicesById((prev) => {
+            const p = prev[id] || { id, name: id };
+            const nextCount = Math.max(Number(p.complianceCount || 0), Number(msg.count || 0));
+
+            return {
+              ...prev,
+              [id]: {
+                ...p,
+                complianceFlag: true,
+                complianceCount: nextCount,
+                complianceLastAt: msg.ts ?? p.complianceLastAt ?? null,
+                complianceLastSeverity: msg.severity ?? p.complianceLastSeverity ?? null,
+              },
+            };
+          });
+
+          if (showCompliance) {
+            fetchComplianceEvents(token, complianceFilterDeviceId || "");
+          }
+          return;
+        }
       };
 
-      ws.onerror = () => {
-        // erro geralmente precede close
-      };
-
-      ws.onclose = () => {
-        scheduleReconnect();
-      };
+      ws.onclose = () => scheduleReconnect();
     };
 
     connectWs();
@@ -379,14 +389,13 @@ function App() {
       closedByCleanup = true;
       cleanupWs();
     };
-  }, [token]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, showCompliance, complianceFilterDeviceId]);
 
   /**
    * ============================================
    * AÇÃO: pedir suporte
    * ============================================
-   * - Envia request_remote_access ao backend
-   * - Backend encaminha consent_request ao agent
    */
   const requestSupport = (deviceId) => {
     const id = normId(deviceId);
@@ -402,50 +411,223 @@ function App() {
 
   /**
    * ============================================
+   * AÇÃO: renomear
+   * ============================================
+   */
+  const startRename = (deviceId) => {
+    const id = normId(deviceId);
+    setEditingDeviceId(id);
+    setEditingValue(getAliasLabel(id) || "");
+  };
+
+  const cancelRename = () => {
+    setEditingDeviceId(null);
+    setEditingValue("");
+  };
+
+  const saveRename = async (deviceId) => {
+    const id = normId(deviceId);
+    const label = String(editingValue || "").trim();
+
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    };
+
+    const res = await fetch(`${HTTP_BASE}/api/device-aliases/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ label }),
+    });
+
+    if (!res.ok) {
+      alert("Falha ao salvar nome do dispositivo.");
+      return;
+    }
+
+    setAliasesById((prev) => ({
+      ...prev,
+      [id]: { label, updatedAt: new Date().toISOString() },
+    }));
+
+    cancelRename();
+  };
+
+  /**
+   * ============================================
    * UI: Login
    * ============================================
    */
   if (!token) return <LoginForm onLogin={login} />;
+
+  const selectedDisplayName = selectedDeviceId
+    ? getDisplayName(devicesById[selectedDeviceId] || { id: selectedDeviceId, name: selectedDeviceId })
+    : "";
+
+  const openCompliancePanel = async (deviceId) => {
+    setShowCompliance(true);
+    const id = normId(deviceId);
+    setComplianceFilterDeviceId(id);
+    await fetchComplianceEvents(token, id);
+  };
+
+  const refreshCompliance = async () => {
+    await fetchComplianceEvents(token, complianceFilterDeviceId || "");
+  };
 
   return (
     <div style={{ padding: 16 }}>
       <h1>MDM Console - Bem-vindo {user?.username}</h1>
 
       <div style={{ marginTop: 16 }}>
-        <h2>Dispositivos</h2>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <h2 style={{ margin: 0 }}>Dispositivos</h2>
+
+          <button
+            onClick={async () => {
+              const next = !showCompliance;
+              setShowCompliance(next);
+              if (next) {
+                setComplianceFilterDeviceId("");
+                await fetchComplianceEvents(token, "");
+              }
+            }}
+          >
+            {showCompliance ? "Fechar Compliance" : "Compliance"}
+          </button>
+        </div>
 
         <ul style={{ paddingLeft: 18 }}>
           {devices.map((d) => {
             const online = isOnline(d);
+            const displayName = getDisplayName(d);
+            const deviceId = d.id;
+
+            const isEditing = editingDeviceId === deviceId;
+
+            const flag = !!d.complianceFlag;
+            const count = Number(d.complianceCount || 0);
 
             return (
               <li key={d.id} style={{ marginBottom: 10 }}>
-                <strong>{d.name}</strong> ({d.user}) -{" "}
-                <span style={{ color: online ? "green" : "gray" }}>
-                  {online ? "Online" : "Offline"}
-                </span>{" "}
-                <button onClick={() => requestSupport(d.id)} disabled={!online}>
-                  Suporte
-                </button>
+                {!isEditing ? (
+                  <>
+                    {flag && (
+                      <span
+                        title={`Compliance: ${count} evento(s) suspeito(s). Clique para ver.`}
+                        style={{ marginRight: 6, cursor: "pointer" }}
+                        onClick={() => openCompliancePanel(deviceId)}
+                      >
+                        ❗{count > 0 ? `(${count})` : ""}
+                      </span>
+                    )}
 
-                {online && (
-                  <button style={{ marginLeft: 8 }} onClick={() => setSelectedDeviceId(d.id)}>
-                    Ver tela
-                  </button>
+                    <strong>{displayName}</strong>{" "}
+                    <span style={{ color: "#777", fontSize: 12 }}>({deviceId})</span>{" "}
+                    -{" "}
+                    <span style={{ color: online ? "green" : "gray" }}>
+                      {online ? "Online" : "Offline"}
+                    </span>{" "}
+                    <button onClick={() => requestSupport(d.id)} disabled={!online}>
+                      Suporte
+                    </button>
+                    {online && (
+                      <button style={{ marginLeft: 8 }} onClick={() => setSelectedDeviceId(d.id)}>
+                        Ver tela
+                      </button>
+                    )}
+                    <button style={{ marginLeft: 8 }} onClick={() => startRename(d.id)}>
+                      Renomear
+                    </button>
+
+                    <span style={{ marginLeft: 10, color: "#666", fontSize: 12 }}>
+                      {d.agentVersion ? `v${d.agentVersion}` : ""}{" "}
+                      {d.lastSeen ? `| lastSeen: ${new Date(d.lastSeen).toLocaleTimeString()}` : ""}{" "}
+                      {flag && d.complianceLastSeverity ? `| compliance: ${d.complianceLastSeverity}` : ""}
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <input
+                      value={editingValue}
+                      onChange={(e) => setEditingValue(e.target.value)}
+                      placeholder="Ex: Lucineia Cruz - Vendas"
+                      style={{ width: 320 }}
+                      autoFocus
+                    />
+                    <button style={{ marginLeft: 8 }} onClick={() => saveRename(d.id)}>
+                      Salvar
+                    </button>
+                    <button style={{ marginLeft: 8 }} onClick={cancelRename}>
+                      Cancelar
+                    </button>
+
+                    <span style={{ marginLeft: 10, color: "#666", fontSize: 12 }}>
+                      Dica: deixe vazio e salve para remover o nome amigável.
+                    </span>
+                  </>
                 )}
-
-                {/* Debug útil em dev/produção */}
-                <span style={{ marginLeft: 10, color: "#666", fontSize: 12 }}>
-                  {d.agentVersion ? `v${d.agentVersion}` : ""}{" "}
-                  {d.lastSeen ? `| lastSeen: ${new Date(d.lastSeen).toLocaleTimeString()}` : ""}
-                </span>
               </li>
             );
           })}
         </ul>
       </div>
 
-      <ScreenViewer deviceId={selectedDeviceId} />
+      {showCompliance && (
+        <div style={{ marginTop: 16, padding: 12, border: "1px solid #ccc", borderRadius: 8, maxWidth: 1100 }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 10 }}>
+            <h2 style={{ margin: 0 }}>Compliance</h2>
+
+            <input
+              value={complianceFilterDeviceId}
+              onChange={(e) => setComplianceFilterDeviceId(e.target.value)}
+              placeholder="Filtrar por deviceId (opcional)"
+              style={{ width: 260 }}
+            />
+            <button
+              onClick={async () => {
+                await fetchComplianceEvents(token, complianceFilterDeviceId || "");
+              }}
+            >
+              Filtrar
+            </button>
+            <button onClick={refreshCompliance}>Atualizar</button>
+
+            <span style={{ marginLeft: 10, color: "#666", fontSize: 12 }}>
+              Fonte: {HTTP_BASE}/api/compliance/events
+            </span>
+          </div>
+
+          <div style={{ color: "#666", fontSize: 12, marginBottom: 10 }}>
+            Clique no ❗ ao lado de um dispositivo para abrir já filtrado.
+          </div>
+
+          <ul style={{ paddingLeft: 18 }}>
+            {complianceEvents.map((ev) => {
+              const id = ev?.id || `${ev?.timestamp || ""}`;
+              const ts = ev?.timestamp ? new Date(ev.timestamp).toLocaleString() : "";
+              const dev = ev?.deviceId || "";
+              const alias = ev?.alias ? ` - ${ev.alias}` : "";
+              const sev = ev?.severity ? String(ev.severity) : "";
+              const author = ev?.author ? String(ev.author) : "";
+              const content = ev?.content ? String(ev.content) : "";
+              const matches = Array.isArray(ev?.matches) ? ev.matches.join(", ") : "";
+
+              return (
+                <li key={id} style={{ marginBottom: 8 }}>
+                  <strong>❗ {sev}</strong> — {ts} — <span style={{ color: "#333" }}>{dev}{alias}</span>{" "}
+                  <span style={{ color: "#777" }}>| autor: {author}</span>
+                  <div style={{ marginTop: 4, color: "#333" }}>{content}</div>
+                  {matches && <div style={{ marginTop: 2, color: "#777", fontSize: 12 }}>match: {matches}</div>}
+                </li>
+              );
+            })}
+            {complianceEvents.length === 0 && <li>Nenhum evento encontrado.</li>}
+          </ul>
+        </div>
+      )}
+
+      <ScreenViewer deviceId={selectedDeviceId} displayName={selectedDisplayName} />
 
       <div style={{ marginTop: 24 }}>
         <h2>Logs</h2>
@@ -465,8 +647,6 @@ function App() {
  * ============================================
  * LoginForm
  * ============================================
- * - simples e direto
- * - evita re-render desnecessário
  */
 function LoginForm({ onLogin }) {
   const [username, setUsername] = useState("");
@@ -483,11 +663,7 @@ function LoginForm({ onLogin }) {
       <h2>Login Admin</h2>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 8, maxWidth: 320 }}>
-        <input
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-          placeholder="Usuário"
-        />
+        <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="Usuário" />
         <input
           type="password"
           value={password}
@@ -497,9 +673,7 @@ function LoginForm({ onLogin }) {
 
         <button type="submit">Entrar</button>
 
-        <div style={{ marginTop: 8, color: "#666", fontSize: 12 }}>
-          Backend: {HTTP_BASE}
-        </div>
+        <div style={{ marginTop: 8, color: "#666", fontSize: 12 }}>Backend: {HTTP_BASE}</div>
       </div>
     </form>
   );

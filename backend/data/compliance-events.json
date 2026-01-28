@@ -1,0 +1,21 @@
+[
+  {
+    "id": "cev_1769631906181_59e00a4ed96d48",
+    "deviceId": "device-483295f1-e728-4a3d-a691-96b9a1498eb5",
+    "alias": null,
+    "author": "admin",
+    "context": "teste-manual",
+    "timestamp": 1769631906181,
+    "content": "depois a gente acerta por fora",
+    "matches": [
+      "depois a gente acerta por fora",
+      "por fora"
+    ],
+    "categories": [
+      "PAGAMENTO_POR_FORA",
+      "KEYWORDS_FRAGMENTADAS"
+    ],
+    "severity": "ALTA",
+    "reincidence": 1
+  }
+]
