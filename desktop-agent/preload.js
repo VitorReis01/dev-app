@@ -4,7 +4,7 @@ const path = require("path");
 contextBridge.exposeInMainWorld("electronAPI", {
   __buildTag: "LOOKOUT-1.0.3-PRELOAD",
 
-  // 👇 ADICIONE ISTO
+  
   getUserDataPath: () => ipcRenderer.invoke("get-user-data-path"),
 
   // CONFIG
