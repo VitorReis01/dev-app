@@ -8,9 +8,7 @@
 
   "scripts": {
     "start": "electron .",
-
     "dist": "electron-builder",
-
     "dist:win": "electron-builder --win",
     "dist:linux": "electron-builder --linux",
     "dist:mac": "electron-builder --mac"
@@ -39,7 +37,9 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ]
     },
