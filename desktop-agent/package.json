@@ -3,7 +3,11 @@
   "version": "1.0.5",
   "description": "Lookout Desktop Agent",
   "main": "main.js",
-  "author": "Lookout",
+  "author": {
+    "name": "Grupo Imesul - Lookout",
+    "email": "midias@grupoimesul.com.br"
+  },
+  "homepage": "https://github.com/VitorReis01/dev-app",
   "license": "MIT",
 
   "scripts": {
@@ -49,7 +53,8 @@
         "AppImage",
         "deb"
       ],
-      "category": "Utility"
+      "category": "Utility",
+      "maintainer": "Grupo Imesul <midias@grupoimesul.com.br>"
     },
 
     "nsis": {
