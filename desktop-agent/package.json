@@ -5,21 +5,21 @@
   "main": "main.js",
   "author": "Lookout",
   "license": "MIT",
-
   "scripts": {
     "start": "electron .",
-    "dist": "electron-builder"
+    "dist": "electron-builder",
+    "dist:win": "electron-builder --win nsis --x64",
+    "dist:linux": "electron-builder --linux appimage deb --x64",
+    "dist:mac": "electron-builder --mac dmg",
+    "dist:all": "electron-builder -mwl"
   },
-
   "dependencies": {
     "ws": "^8.16.0"
   },
-
   "devDependencies": {
     "electron": "^28.2.0",
     "electron-builder": "^24.13.3"
   },
-
   "build": {
     "appId": "com.lookout.agent",
     "productName": "Lookout Agent",
@@ -44,6 +44,30 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "deb",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "category": "Utility",
+      "artifactName": "${productName}-${version}-${os}-${arch}.${ext}"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "artifactName": "${productName}-${version}-${os}-${arch}.${ext}"
     }
   }
 }

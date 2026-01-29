@@ -3,13 +3,17 @@
 /**
  * Lookout Desktop Agent – PRODUÇÃO
  *
- * ✔ DeviceId automático (UUID persistido)  [AGORA GLOBAL POR MÁQUINA]
+ * ✔ DeviceId automático (UUID persistido)  [GLOBAL POR MÁQUINA quando possível]
  * ✔ Zero input do usuário
  * ✔ Multi-PC garantido
  * ✔ WebSocket com heartbeat
  * ✔ Reconexão automática
- * ✔ Anti-múltiplas sessões RDP (LOCK GLOBAL)
+ * ✔ Anti-múltiplas sessões (LOCK GLOBAL)
  * ✔ Pronto para escala LAN
+ *
+ * ✅ FIX CROSS-PLATFORM:
+ * - Antes: storage/lock hardcoded em C:\ProgramData\... (Windows-only)
+ * - Agora: paths por SO + fallback seguro quando global não tiver permissão
  */
 
 const { app, BrowserWindow, dialog, desktopCapturer } = require("electron");
@@ -27,23 +31,96 @@ const BACKEND_PORT = 3001;
 const AGENT_VERSION = "1.0.5";
 
 // ============================
-// STORAGE GLOBAL (POR MÁQUINA)
+// STORAGE GLOBAL (POR MÁQUINA) - CROSS PLATFORM
 // ============================
-// Importante: userData é por usuário/sessão. Em RDP vira caos.
-// ProgramData é por máquina e acessível em todas as sessões.
-const PROGRAM_DATA = process.env.ProgramData || "C:\\ProgramData";
-const BASE_DIR = path.join(PROGRAM_DATA, "LOOKOUT");
+
+/**
+ * ✅ Regras:
+ * - Windows: C:\ProgramData\LOOKOUT\ (global por máquina)
+ * - Linux: tenta /var/lib/lookout/ (global por máquina)
+ *   - se sem permissão: fallback para ~/.lookout/ (por usuário, mas não quebra execução)
+ * - macOS: tenta /Library/Application Support/LOOKOUT (global por máquina)
+ *   - se sem permissão: fallback para ~/Library/Application Support/LOOKOUT (por usuário)
+ *
+ * Obs: Se você quiser forçar path (deploy corporativo),
+ * pode setar env LOOKOUT_BASE_DIR=/caminho/custom
+ */
+function ensureDir(dir) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function canWrite(dir) {
+  try {
+    const p = path.join(dir, ".write_test");
+    fs.writeFileSync(p, "ok");
+    fs.unlinkSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveBaseDir() {
+  // ✅ override manual (deploy corporativo)
+  const forced = String(process.env.LOOKOUT_BASE_DIR || "").trim();
+  if (forced) {
+    if (ensureDir(forced)) return forced;
+  }
+
+  const platform = process.platform;
+
+  // Windows (global por máquina)
+  if (platform === "win32") {
+    const PROGRAM_DATA = process.env.ProgramData || "C:\\ProgramData";
+    const dir = path.join(PROGRAM_DATA, "LOOKOUT");
+    ensureDir(dir);
+    return dir;
+  }
+
+  // Linux (tenta global, fallback user)
+  if (platform === "linux") {
+    const dir1 = "/var/lib/lookout";
+    if (ensureDir(dir1) && canWrite(dir1)) return dir1;
+
+    const dir2 = "/var/local/lookout";
+    if (ensureDir(dir2) && canWrite(dir2)) return dir2;
+
+    const home = process.env.HOME || process.env.USERPROFILE || process.cwd();
+    const dir3 = path.join(home, ".lookout");
+    ensureDir(dir3);
+    return dir3;
+  }
+
+  // macOS (tenta global, fallback user)
+  if (platform === "darwin") {
+    const dir1 = "/Library/Application Support/LOOKOUT";
+    if (ensureDir(dir1) && canWrite(dir1)) return dir1;
+
+    const home = process.env.HOME || process.cwd();
+    const dir2 = path.join(home, "Library", "Application Support", "LOOKOUT");
+    ensureDir(dir2);
+    return dir2;
+  }
+
+  // Outros SOs (fallback simples)
+  const home = process.env.HOME || process.env.USERPROFILE || process.cwd();
+  const dir = path.join(home, ".lookout");
+  ensureDir(dir);
+  return dir;
+}
+
+// ✅ Resolvido uma vez (evita inconsistência de paths)
+const BASE_DIR = resolveBaseDir();
 const CONFIG_PATH = path.join(BASE_DIR, "agent-config.json");
 const LOCK_PATH = path.join(BASE_DIR, "agent.lock");
 
-function ensureBaseDir() {
-  try {
-    fs.mkdirSync(BASE_DIR, { recursive: true });
-  } catch {}
-}
-
 // ============================
-// LOCK GLOBAL (ANTI-RDP MULTI-SESSION)
+// LOCK GLOBAL (ANTI-MULTI-SESSION)
 // ============================
 
 function processExists(pid) {
@@ -57,8 +134,6 @@ function processExists(pid) {
 }
 
 function tryAcquireGlobalLock() {
-  ensureBaseDir();
-
   // 1) Se existe lock, tenta entender se é órfão (crash)
   if (fs.existsSync(LOCK_PATH)) {
     try {
@@ -90,8 +165,15 @@ function tryAcquireGlobalLock() {
       pid: process.pid,
       startedAt: new Date().toISOString(),
       version: AGENT_VERSION,
+      platform: process.platform,
+      baseDir: BASE_DIR,
+
+      // Windows
       session: process.env.SESSIONNAME || null,
-      username: process.env.USERNAME || null
+      username: process.env.USERNAME || null,
+
+      // Linux/mac
+      user: process.env.USER || null
     };
     fs.writeFileSync(fd, JSON.stringify(owner, null, 2));
     fs.closeSync(fd);
@@ -119,12 +201,10 @@ function releaseGlobalLock() {
 }
 
 // ============================
-// DEVICE ID PERSISTENTE (GLOBAL)
+// DEVICE ID PERSISTENTE (GLOBAL QUANDO POSSÍVEL)
 // ============================
 
 function getOrCreateDeviceId() {
-  ensureBaseDir();
-
   try {
     if (fs.existsSync(CONFIG_PATH)) {
       const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
@@ -136,7 +216,9 @@ function getOrCreateDeviceId() {
   const cfg = {
     deviceId,
     createdAt: new Date().toISOString(),
-    version: AGENT_VERSION
+    version: AGENT_VERSION,
+    platform: process.platform,
+    baseDir: BASE_DIR
   };
 
   try {
@@ -156,8 +238,8 @@ let mainWindow = null;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 420,
-    height: 220,
+    width: 460,
+    height: 240,
     resizable: false,
     show: true,
     webPreferences: {
@@ -171,6 +253,7 @@ function createWindow() {
         <h2>Lookout Agent</h2>
         <div>Device ID: <b>${DEVICE_ID}</b></div>
         <div>Versão: ${AGENT_VERSION}</div>
+        <div>BaseDir: <code>${BASE_DIR}</code></div>
         <div id="st" style="margin-top:10px;padding:10px;border:1px solid #ccc">
           Conectando...
         </div>
@@ -337,21 +420,18 @@ function stopStreaming() {
 // APP
 // ============================
 
-// Também ajuda dentro da mesma sessão/usuário (não resolve RDP sozinho, mas é bônus)
+// ✅ Single-instance (mesmo user). Bônus.
 const gotSingleInstance = app.requestSingleInstanceLock();
 if (!gotSingleInstance) {
-  // Não mostra nada — encerra silencioso
   try {
     app.quit();
   } catch {}
 }
 
 app.whenReady().then(async () => {
-  // 1) LOCK GLOBAL POR MÁQUINA (resolve RDP multi-session)
+  // 1) LOCK GLOBAL
   const lock = tryAcquireGlobalLock();
   if (!lock.ok) {
-    // Não cria janela para não incomodar usuário em outra sessão.
-    // Só encerra silenciosamente.
     try {
       app.quit();
     } catch {}
