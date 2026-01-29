@@ -13,7 +13,7 @@
  *
  * ✅ FIX CROSS-PLATFORM:
  * - Antes: storage/lock hardcoded em C:\ProgramData\... (Windows-only)
- * - Agora: paths por SO + fallback seguro quando global não tiver permissão
+ * - paths por SO + fallback seguro quando global não tiver permissão
  */
 
 const { app, BrowserWindow, dialog, desktopCapturer } = require("electron");
