@@ -1,4 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import BackgroundEye from "./components/BackgroundEye";
+import "./app-shell.css";
 
 /**
  * ============================================
@@ -73,7 +75,7 @@ function applyPresencePatch(prevById, patch) {
  * ScreenViewer
  * ============================================
  */
-function ScreenViewer({ deviceId, displayName }) {
+function ScreenViewer({ deviceId, displayName, onClose }) {
   const [tick, setTick] = useState(0);
   const viewerRef = useRef(null);
 
@@ -102,52 +104,115 @@ function ScreenViewer({ deviceId, displayName }) {
     } catch { }
   };
 
+  const closeViewer = async () => {
+    await exitFullscreen();
+    if (typeof onClose === "function") onClose();
+  };
+
   if (!deviceId) return null;
 
   const frameUrl = `${HTTP_BASE}/api/devices/${deviceId}/frame?ts=${tick}`;
 
   return (
-    <div style={{ marginTop: 20 }}>
-      <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 10 }}>
-        <h2 style={{ margin: 0 }}>
-          Tela do dispositivo: {displayName ? displayName : deviceId}{" "}
-          <span style={{ color: "#777", fontSize: 12 }}>({deviceId})</span>
-        </h2>
+    <div className="panel" style={{ marginTop: 18 }}>
+      <div className="panel-head">
+        <div>
+          <div className="panel-title">
+            Tela do dispositivo: {displayName ? displayName : deviceId}{" "}
+            <span className="muted" style={{ fontSize: 12 }}>
+              ({deviceId})
+            </span>
+          </div>
+          <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+            Dica: duplo clique para tela cheia. ESC para sair do fullscreen.
+          </div>
+        </div>
 
-        <button onClick={enterFullscreen}>Tela cheia</button>
-        <button onClick={exitFullscreen}>Sair</button>
+        <div className="row" style={{ gap: 8 }}>
+          <button className="btn" onClick={enterFullscreen}>
+            Tela cheia
+          </button>
 
-        <button onClick={() => window.open(frameUrl, "_blank")}>Abrir em nova guia</button>
+          <button className="btn" onClick={exitFullscreen} title="Sai do fullscreen, mas mantém o viewer aberto">
+            Sair tela cheia
+          </button>
+
+          <button className="btn" onClick={closeViewer} title="Fecha o viewer e limpa a seleção">
+            Fechar
+          </button>
+
+          <button className="btn red" onClick={() => window.open(frameUrl, "_blank")}>
+            Abrir em nova guia
+          </button>
+        </div>
       </div>
 
       <div
         ref={viewerRef}
         onDoubleClick={enterFullscreen}
-        style={{
-          width: "100%",
-          maxWidth: 1100,
-          border: "2px solid #333",
-          borderRadius: 8,
-          background: "#000",
-          overflow: "hidden",
-          cursor: "zoom-in",
-        }}
+        className="viewer"
         title="Duplo clique para tela cheia"
       >
-        <img
-          src={frameUrl}
-          alt="screen"
-          style={{
-            width: "100%",
-            display: "block",
-          }}
-        />
-      </div>
-
-      <div style={{ marginTop: 8, color: "#666" }}>
-        Dica: duplo clique na tela para entrar em tela cheia. ESC para sair.
+        <img src={frameUrl} alt="screen" className="viewer-img" />
       </div>
     </div>
+  );
+}
+
+/**
+ * ============================================
+ * LoginForm
+ * ============================================
+ */
+function LoginForm({ onLogin }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+
+  return (
+    <>
+      <BackgroundEye />
+      <div className="app-layer">
+        <div className="login-wrap">
+          <div className="login-card">
+            <div className="login-brand">
+              <span className="logo-dot">👁️</span>
+              <span>LOOKOUT</span>
+            </div>
+            <div className="login-sub">Admin Console</div>
+
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                onLogin(username, password);
+              }}
+            >
+              <div className="field">
+                <label>Usuário</label>
+                <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="admin" />
+              </div>
+
+              <div className="field">
+                <label>Senha</label>
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="••••••••"
+                />
+              </div>
+
+              <button className="btn red full" type="submit">
+                Entrar
+              </button>
+
+              <div className="muted" style={{ marginTop: 10, fontSize: 12 }}>
+                Backend: {HTTP_BASE}
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+    </>
   );
 }
 
@@ -163,26 +228,50 @@ function App() {
   const [devicesById, setDevicesById] = useState({});
   const [logs, setLogs] = useState([]);
 
-  // ✅ Aliases persistidos no backend
   const [aliasesById, setAliasesById] = useState({});
 
-  // UI rename
   const [editingDeviceId, setEditingDeviceId] = useState(null);
   const [editingValue, setEditingValue] = useState("");
 
   const [selectedDeviceId, setSelectedDeviceId] = useState(null);
 
-  // ✅ Compliance UI (painel)
   const [showCompliance, setShowCompliance] = useState(false);
   const [complianceEvents, setComplianceEvents] = useState([]);
   const [complianceFilterDeviceId, setComplianceFilterDeviceId] = useState("");
+
+  const [activeTab, setActiveTab] = useState("devices");
+  const [searchTerm, setSearchTerm] = useState("");
+
+  // ✅ Refresh UX
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [lastRefreshAt, setLastRefreshAt] = useState(null);
 
   const wsRef = useRef(null);
   const reconnectTimerRef = useRef(null);
   const reconnectAttemptsRef = useRef(0);
 
   const devices = useMemo(() => {
-    return Object.values(devicesById).sort((a, b) => a.id.localeCompare(b.id));
+    const list = Object.values(devicesById).sort((a, b) => a.id.localeCompare(b.id));
+
+    const q = String(searchTerm || "").trim().toLowerCase();
+    if (!q) return list;
+
+    return list.filter((d) => {
+      const id = String(d.id || "").toLowerCase();
+      const alias = String((aliasesById[d.id]?.label || "")).toLowerCase();
+      const name = String(d.name || "").toLowerCase();
+      return id.includes(q) || alias.includes(q) || name.includes(q);
+    });
+  }, [devicesById, searchTerm, aliasesById]);
+
+  const kpi = useMemo(() => {
+    let online = 0, offline = 0, conn = 0;
+    for (const d of Object.values(devicesById)) {
+      const o = isOnline(d);
+      if (o) online += 1;
+      else offline += 1;
+    }
+    return { online, offline, conn, total: Object.values(devicesById).length };
   }, [devicesById]);
 
   const getAliasLabel = (deviceId) => {
@@ -201,7 +290,7 @@ function App() {
 
   /**
    * ============================================
-   * LOGIN
+   * LOGIN / LOGOUT
    * ============================================
    */
   const login = async (username, password) => {
@@ -221,6 +310,30 @@ function App() {
     setUser(data.user);
   };
 
+  const logout = () => {
+    try {
+      wsRef.current?.close();
+    } catch { }
+    wsRef.current = null;
+
+    setSelectedDeviceId(null);
+    setEditingDeviceId(null);
+    setEditingValue("");
+    setShowCompliance(false);
+    setComplianceEvents([]);
+    setComplianceFilterDeviceId("");
+    setDevicesById({});
+    setLogs([]);
+    setAliasesById({});
+    setActiveTab("devices");
+    setSearchTerm("");
+    setIsRefreshing(false);
+    setLastRefreshAt(null);
+
+    setToken(null);
+    setUser(null);
+  };
+
   /**
    * ============================================
    * REST SNAPSHOT
@@ -229,25 +342,22 @@ function App() {
   const fetchDevices = async (authToken) => {
     const headers = { Authorization: `Bearer ${authToken}` };
     const res = await fetch(`${HTTP_BASE}/api/devices`, { headers });
-    if (!res.ok) return;
-
+    if (!res.ok) throw new Error("Falha ao buscar /api/devices");
     const list = await res.json();
-
-    // ✅ IMPORTANTE: replace total (remove ghosts)
     setDevicesById(arrayToMapById(list));
   };
 
   const fetchLogs = async (authToken) => {
     const headers = { Authorization: `Bearer ${authToken}` };
     const res = await fetch(`${HTTP_BASE}/api/logs`, { headers });
-    if (!res.ok) return;
+    if (!res.ok) throw new Error("Falha ao buscar /api/logs");
     setLogs(await res.json());
   };
 
   const fetchAliases = async (authToken) => {
     const headers = { Authorization: `Bearer ${authToken}` };
     const res = await fetch(`${HTTP_BASE}/api/device-aliases`, { headers });
-    if (!res.ok) return;
+    if (!res.ok) throw new Error("Falha ao buscar /api/device-aliases");
 
     const data = await res.json();
     const normalized = {};
@@ -267,18 +377,52 @@ function App() {
     setAliasesById(normalized);
   };
 
-  // ✅ Compliance events
   const fetchComplianceEvents = async (authToken, deviceIdFilter) => {
     const headers = { Authorization: `Bearer ${authToken}` };
     const q = deviceIdFilter ? `?deviceId=${encodeURIComponent(deviceIdFilter)}` : "";
     const res = await fetch(`${HTTP_BASE}/api/compliance/events${q}`, { headers });
-    if (!res.ok) return;
+    if (!res.ok) throw new Error("Falha ao buscar /api/compliance/events");
     setComplianceEvents(await res.json());
   };
 
   const fetchData = async (authToken) => {
     if (!authToken) return;
     await Promise.all([fetchDevices(authToken), fetchLogs(authToken), fetchAliases(authToken)]);
+  };
+
+  /**
+   * ============================================
+   * REFRESH 
+   * ============================================
+   */
+  const refreshAll = async () => {
+    if (!token) return;
+    if (isRefreshing) return;
+
+    setIsRefreshing(true);
+    try {
+      await fetchData(token);
+
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ type: "get_snapshot" }));
+        } catch (e) {
+          console.error("Erro ao enviar snapshot via WebSocket:", e);
+        }
+      }
+
+      // se painel de compliance estiver aberto, atualiza também
+      if (showCompliance) {
+        await fetchComplianceEvents(token, complianceFilterDeviceId || "");
+      }
+
+      setLastRefreshAt(Date.now());
+    } catch (e) {
+      alert(`Falha ao atualizar: ${e.message || String(e)}`);
+    } finally {
+      setIsRefreshing(false);
+    }
   };
 
   /**
@@ -322,7 +466,8 @@ function App() {
 
       ws.onopen = async () => {
         reconnectAttemptsRef.current = 0;
-        await fetchData(token);
+        // primeira carga: usa o refreshAll para ter feedback e consistência
+        await refreshAll();
       };
 
       ws.onmessage = (e) => {
@@ -334,7 +479,6 @@ function App() {
         }
 
         if (msg.type === "devices_snapshot" && Array.isArray(msg.devices)) {
-          // ✅ IMPORTANTE: replace total (remove ghosts)
           setDevicesById(arrayToMapById(msg.devices));
           return;
         }
@@ -346,7 +490,7 @@ function App() {
 
         if (msg.type === "consent_response") {
           alert(`Dispositivo ${msg.deviceId} ${msg.accepted ? "aceitou" : "recusou"} o suporte.`);
-          fetchLogs(token);
+          fetchLogs(token).catch(() => { });
 
           if (msg.accepted) {
             setSelectedDeviceId(normId(msg.deviceId));
@@ -354,7 +498,6 @@ function App() {
           return;
         }
 
-        // ✅ Realtime: evento SUSPEITO => liga o ❗ já
         if (msg.type === "compliance_event" && msg.deviceId) {
           const id = normId(msg.deviceId);
           setDevicesById((prev) => {
@@ -374,7 +517,7 @@ function App() {
           });
 
           if (showCompliance) {
-            fetchComplianceEvents(token, complianceFilterDeviceId || "");
+            fetchComplianceEvents(token, complianceFilterDeviceId || "").catch(() => { });
           }
           return;
         }
@@ -394,7 +537,7 @@ function App() {
 
   /**
    * ============================================
-   * AÇÃO: pedir suporte
+   * AÇÕES
    * ============================================
    */
   const requestSupport = (deviceId) => {
@@ -409,11 +552,6 @@ function App() {
     }
   };
 
-  /**
-   * ============================================
-   * AÇÃO: renomear
-   * ============================================
-   */
   const startRename = (deviceId) => {
     const id = normId(deviceId);
     setEditingDeviceId(id);
@@ -468,214 +606,436 @@ function App() {
     setShowCompliance(true);
     const id = normId(deviceId);
     setComplianceFilterDeviceId(id);
-    await fetchComplianceEvents(token, id);
+    try {
+      await fetchComplianceEvents(token, id);
+    } catch (e) {
+      alert(`Falha no compliance: ${e.message || String(e)}`);
+    }
   };
 
   const refreshCompliance = async () => {
-    await fetchComplianceEvents(token, complianceFilterDeviceId || "");
+    try {
+      await fetchComplianceEvents(token, complianceFilterDeviceId || "");
+    } catch (e) {
+      alert(`Falha no compliance: ${e.message || String(e)}`);
+    }
   };
 
+  const navigate = (tab) => {
+    setActiveTab(tab);
+    setSelectedDeviceId(null);
+  };
+
+  const lastRefreshLabel = lastRefreshAt ? new Date(lastRefreshAt).toLocaleTimeString() : "—";
+
   return (
-    <div style={{ padding: 16 }}>
-      <h1>MDM Console - Bem-vindo {user?.username}</h1>
+    <>
+      <BackgroundEye />
 
-      <div style={{ marginTop: 16 }}>
-        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-          <h2 style={{ margin: 0 }}>Dispositivos</h2>
+      <div className="app-layer">
+        <div className="shell">
+          {/* SIDEBAR */}
+          <aside className="sidebar">
+            <div className="brand">
+              <div className="brand-badge">👁️</div>
+              LOOKOUT
+            </div>
 
-          <button
-            onClick={async () => {
-              const next = !showCompliance;
-              setShowCompliance(next);
-              if (next) {
-                setComplianceFilterDeviceId("");
-                await fetchComplianceEvents(token, "");
-              }
-            }}
-          >
-            {showCompliance ? "Fechar Compliance" : "Compliance"}
-          </button>
-        </div>
+            <nav className="nav">
+              <a
+                className={activeTab === "devices" ? "active" : ""}
+                href="#"
+                onClick={(e) => {
+                  e.preventDefault();
+                  navigate("devices");
+                }}
+              >
+                Dispositivos
+              </a>
 
-        <ul style={{ paddingLeft: 18 }}>
-          {devices.map((d) => {
-            const online = isOnline(d);
-            const displayName = getDisplayName(d);
-            const deviceId = d.id;
+              <a
+                className={activeTab === "logs" ? "active" : ""}
+                href="#"
+                onClick={(e) => {
+                  e.preventDefault();
+                  navigate("logs");
+                }}
+              >
+                Logs
+              </a>
 
-            const isEditing = editingDeviceId === deviceId;
+              <a
+                className={activeTab === "settings" ? "active" : ""}
+                href="#"
+                onClick={(e) => {
+                  e.preventDefault();
+                  navigate("settings");
+                }}
+              >
+                Configurações
+              </a>
+            </nav>
 
-            const flag = !!d.complianceFlag;
-            const count = Number(d.complianceCount || 0);
+            <div className="sidebar-foot muted" style={{ marginTop: 12, fontSize: 12 }}>
+              Backend: {HTTP_BASE}
+              <div style={{ marginTop: 10 }}>
+                <button className="btn" onClick={logout} title="Sair do admin e voltar ao login">
+                  Sair
+                </button>
+              </div>
+            </div>
+          </aside>
 
-            return (
-              <li key={d.id} style={{ marginBottom: 10 }}>
-                {!isEditing ? (
-                  <>
-                    {flag && (
-                      <span
-                        title={`Compliance: ${count} evento(s) suspeito(s). Clique para ver.`}
-                        style={{ marginRight: 6, cursor: "pointer" }}
-                        onClick={() => openCompliancePanel(deviceId)}
-                      >
-                        ❗{count > 0 ? `(${count})` : ""}
-                      </span>
-                    )}
+          {/* TOPBAR */}
+          <header className="topbar">
+            <div className="title">
+              MDM Console
+              <div className="muted" style={{ fontSize: 12 }}>
+                Bem-vindo {user?.username} • atualizado: {lastRefreshLabel}
+              </div>
+            </div>
 
-                    <strong>{displayName}</strong>{" "}
-                    <span style={{ color: "#777", fontSize: 12 }}>({deviceId})</span>{" "}
-                    -{" "}
-                    <span style={{ color: online ? "green" : "gray" }}>
-                      {online ? "Online" : "Offline"}
-                    </span>{" "}
-                    <button onClick={() => requestSupport(d.id)} disabled={!online}>
-                      Suporte
+            <div className="search">
+              <input
+                placeholder="Buscar por alias ou ID..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                disabled={activeTab !== "devices"}
+                title={activeTab !== "devices" ? "Disponível na aba Dispositivos" : ""}
+              />
+            </div>
+
+            <div className="user-pill">Admin</div>
+          </header>
+
+          {/* MAIN */}
+          <main className="main">
+            {activeTab === "devices" && (
+              <>
+                <div className="main-head">
+                  <div>
+                    <h1 className="h1">Dispositivos</h1>
+                    <p className="sub">Gerencie computadores conectados e solicite suporte remoto.</p>
+                  </div>
+
+                  <div className="row" style={{ gap: 8 }}>
+                    <button
+                      className={`btn ${showCompliance ? "red" : ""}`}
+                      onClick={async () => {
+                        const next = !showCompliance;
+                        setShowCompliance(next);
+                        if (next) {
+                          setComplianceFilterDeviceId("");
+                          try {
+                            await fetchComplianceEvents(token, "");
+                          } catch (e) {
+                            alert(`Falha no compliance: ${e.message || String(e)}`);
+                          }
+                        }
+                      }}
+                    >
+                      {showCompliance ? "Fechar Compliance" : "Compliance"}
                     </button>
-                    {online && (
-                      <button style={{ marginLeft: 8 }} onClick={() => setSelectedDeviceId(d.id)}>
-                        Ver tela
-                      </button>
-                    )}
-                    <button style={{ marginLeft: 8 }} onClick={() => startRename(d.id)}>
-                      Renomear
-                    </button>
 
-                    <span style={{ marginLeft: 10, color: "#666", fontSize: 12 }}>
-                      {d.agentVersion ? `v${d.agentVersion}` : ""}{" "}
-                      {d.lastSeen ? `| lastSeen: ${new Date(d.lastSeen).toLocaleTimeString()}` : ""}{" "}
-                      {flag && d.complianceLastSeverity ? `| compliance: ${d.complianceLastSeverity}` : ""}
-                    </span>
-                  </>
-                ) : (
-                  <>
-                    <input
-                      value={editingValue}
-                      onChange={(e) => setEditingValue(e.target.value)}
-                      placeholder="Ex: Lucineia Cruz - Vendas"
-                      style={{ width: 320 }}
-                      autoFocus
-                    />
-                    <button style={{ marginLeft: 8 }} onClick={() => saveRename(d.id)}>
-                      Salvar
+                    <button className="btn" onClick={refreshAll} disabled={isRefreshing}>
+                      {isRefreshing ? "Atualizando..." : "Atualizar"}
                     </button>
-                    <button style={{ marginLeft: 8 }} onClick={cancelRename}>
-                      Cancelar
-                    </button>
+                  </div>
+                </div>
 
-                    <span style={{ marginLeft: 10, color: "#666", fontSize: 12 }}>
-                      Dica: deixe vazio e salve para remover o nome amigável.
-                    </span>
-                  </>
+                {/* KPI CARDS */}
+                <section className="cards">
+                  <div className="card">
+                    <div className="kpi">{kpi.online}</div>
+                    <div className="kpi-label">Online agora</div>
+                  </div>
+                  <div className="card">
+                    <div className="kpi">{kpi.offline}</div>
+                    <div className="kpi-label">Offline</div>
+                  </div>
+                  <div className="card">
+                    <div className="kpi">{kpi.conn}</div>
+                    <div className="kpi-label">Conectando</div>
+                  </div>
+                  <div className="card">
+                    <div className="kpi">{kpi.total}</div>
+                    <div className="kpi-label">Total</div>
+                  </div>
+                </section>
+
+                {/* TABELA */}
+                <section className="panel">
+                  <div className="panel-head">
+                    <div>
+                      <div className="panel-title">Lista de dispositivos</div>
+                      <div className="muted" style={{ fontSize: 12 }}>
+                        Clique em “Suporte” para solicitar acesso e “Ver tela” após autorização.
+                      </div>
+                    </div>
+                  </div>
+
+                  <table className="table">
+                    <thead>
+                      <tr>
+                        <th>Alias / Nome</th>
+                        <th>ID</th>
+                        <th>Status</th>
+                        <th>Compliance</th>
+                        <th>Versão</th>
+                        <th>Último</th>
+                        <th>Ações</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {devices.map((d) => {
+                        const online = isOnline(d);
+                        const displayName = getDisplayName(d);
+                        const deviceId = d.id;
+                        const isEditing = editingDeviceId === deviceId;
+
+                        const flag = !!d.complianceFlag;
+                        const count = Number(d.complianceCount || 0);
+
+                        return (
+                          <tr key={d.id}>
+                            <td>
+                              <div style={{ fontWeight: 700 }}>{displayName}</div>
+                              {!isEditing && getAliasLabel(deviceId) ? (
+                                <div className="muted" style={{ fontSize: 12 }}>
+                                  alias salvo
+                                </div>
+                              ) : null}
+                            </td>
+
+                            <td className="muted">{deviceId}</td>
+
+                            <td>
+                              <span className="badge">
+                                <span className={`dot ${online ? "online" : "offline"}`} />
+                                {online ? "Online" : "Offline"}
+                              </span>
+                            </td>
+
+                            <td>
+                              {flag ? (
+                                <button className="badge-btn" onClick={() => openCompliancePanel(deviceId)} title="Ver eventos">
+                                  ❗ {count > 0 ? `(${count})` : ""}
+                                </button>
+                              ) : (
+                                <span className="muted">—</span>
+                              )}
+                            </td>
+
+                            <td className="muted">{d.agentVersion ? `v${d.agentVersion}` : "—"}</td>
+
+                            <td className="muted">
+                              {d.lastSeen ? new Date(d.lastSeen).toLocaleTimeString() : "—"}
+                              {flag && d.complianceLastSeverity ? (
+                                <div className="muted" style={{ fontSize: 12 }}>
+                                  {String(d.complianceLastSeverity)}
+                                </div>
+                              ) : null}
+                            </td>
+
+                            <td>
+                              {!isEditing ? (
+                                <div className="row" style={{ gap: 8 }}>
+                                  <button className="btn red" onClick={() => requestSupport(d.id)} disabled={!online}>
+                                    Suporte
+                                  </button>
+                                  <button className="btn" onClick={() => setSelectedDeviceId(d.id)} disabled={!online}>
+                                    Ver tela
+                                  </button>
+                                  <button className="btn" onClick={() => startRename(d.id)}>
+                                    Renomear
+                                  </button>
+                                </div>
+                              ) : (
+                                <div className="row" style={{ gap: 8 }}>
+                                  <input
+                                    className="inline-input"
+                                    value={editingValue}
+                                    onChange={(e) => setEditingValue(e.target.value)}
+                                    placeholder="Ex: Loja 03 / Financeiro"
+                                    autoFocus
+                                  />
+                                  <button className="btn red" onClick={() => saveRename(d.id)}>
+                                    Salvar
+                                  </button>
+                                  <button className="btn" onClick={cancelRename}>
+                                    Cancelar
+                                  </button>
+                                </div>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                      {devices.length === 0 && (
+                        <tr>
+                          <td colSpan={7} className="muted" style={{ padding: 16 }}>
+                            Nenhum dispositivo encontrado.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </section>
+
+                {/* COMPLIANCE */}
+                {showCompliance && (
+                  <section className="panel" style={{ marginTop: 18 }}>
+                    <div className="panel-head">
+                      <div>
+                        <div className="panel-title">Compliance</div>
+                        <div className="muted" style={{ fontSize: 12 }}>
+                          Fonte: {HTTP_BASE}/api/compliance/events
+                        </div>
+                      </div>
+
+                      <div className="row" style={{ gap: 8 }}>
+                        <input
+                          className="inline-input"
+                          value={complianceFilterDeviceId}
+                          onChange={(e) => setComplianceFilterDeviceId(e.target.value)}
+                          placeholder="Filtrar por deviceId (opcional)"
+                          style={{ width: 260 }}
+                        />
+                        <button className="btn" onClick={refreshCompliance}>
+                          Atualizar
+                        </button>
+                      </div>
+                    </div>
+
+                    <ul className="list">
+                      {complianceEvents.map((ev) => {
+                        const id = ev?.id || `${ev?.timestamp || ""}`;
+                        const ts = ev?.timestamp ? new Date(ev.timestamp).toLocaleString() : "";
+                        const dev = ev?.deviceId || "";
+                        const alias = ev?.alias ? ` - ${ev.alias}` : "";
+                        const sev = ev?.severity ? String(ev.severity) : "";
+                        const author = ev?.author ? String(ev.author) : "";
+                        const content = ev?.content ? String(ev.content) : "";
+                        const matches = Array.isArray(ev?.matches) ? ev.matches.join(", ") : "";
+
+                        return (
+                          <li key={id} className="list-item">
+                            <div style={{ fontWeight: 800 }}>❗ {sev}</div>
+                            <div className="muted" style={{ fontSize: 12 }}>
+                              {ts}
+                            </div>
+                            <div style={{ marginTop: 6 }}>
+                              <span style={{ fontWeight: 700 }}>
+                                {dev}
+                                {alias}
+                              </span>{" "}
+                              <span className="muted" style={{ fontSize: 12 }}>
+                                | autor: {author}
+                              </span>
+                            </div>
+                            <div style={{ marginTop: 6 }}>{content}</div>
+                            {matches && (
+                              <div className="muted" style={{ marginTop: 4, fontSize: 12 }}>
+                                match: {matches}
+                              </div>
+                            )}
+                          </li>
+                        );
+                      })}
+                      {complianceEvents.length === 0 && <li className="muted">Nenhum evento encontrado.</li>}
+                    </ul>
+                  </section>
                 )}
-              </li>
-            );
-          })}
-        </ul>
-      </div>
 
-      {showCompliance && (
-        <div style={{ marginTop: 16, padding: 12, border: "1px solid #ccc", borderRadius: 8, maxWidth: 1100 }}>
-          <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 10 }}>
-            <h2 style={{ margin: 0 }}>Compliance</h2>
+                {/* VIEWER */}
+                <ScreenViewer
+                  deviceId={selectedDeviceId}
+                  displayName={selectedDisplayName}
+                  onClose={() => setSelectedDeviceId(null)}
+                />
+              </>
+            )}
 
-            <input
-              value={complianceFilterDeviceId}
-              onChange={(e) => setComplianceFilterDeviceId(e.target.value)}
-              placeholder="Filtrar por deviceId (opcional)"
-              style={{ width: 260 }}
-            />
-            <button
-              onClick={async () => {
-                await fetchComplianceEvents(token, complianceFilterDeviceId || "");
-              }}
-            >
-              Filtrar
-            </button>
-            <button onClick={refreshCompliance}>Atualizar</button>
+            {activeTab === "logs" && (
+              <section className="panel">
+                <div className="panel-head">
+                  <div>
+                    <div className="panel-title">Logs</div>
+                    <div className="muted" style={{ fontSize: 12 }}>
+                      Eventos do sistema
+                    </div>
+                  </div>
+                  <button className="btn" onClick={refreshAll} disabled={isRefreshing}>
+                    {isRefreshing ? "Atualizando..." : "Atualizar"}
+                  </button>
+                </div>
 
-            <span style={{ marginLeft: 10, color: "#666", fontSize: 12 }}>
-              Fonte: {HTTP_BASE}/api/compliance/events
-            </span>
-          </div>
+                <ul className="list">
+                  {logs.map((log, i) => (
+                    <li key={i} className="list-item">
+                      <span className="muted">
+                        {log?.timestamp ? String(log.timestamp) : log?.ts ? new Date(log.ts).toLocaleString() : ""}
+                      </span>{" "}
+                      — {log?.action ? log.action : log?.msg ? log.msg : JSON.stringify(log)}
+                    </li>
+                  ))}
+                  {logs.length === 0 && <li className="muted">Sem logs no momento.</li>}
+                </ul>
+              </section>
+            )}
 
-          <div style={{ color: "#666", fontSize: 12, marginBottom: 10 }}>
-            Clique no ❗ ao lado de um dispositivo para abrir já filtrado.
-          </div>
+            {activeTab === "settings" && (
+              <section className="panel">
+                <div className="panel-head">
+                  <div>
+                    <div className="panel-title">Configurações</div>
+                    <div className="muted" style={{ fontSize: 12 }}>
+                      Tela administrativa (placeholder).
+                    </div>
+                  </div>
+                  <button className="btn" onClick={refreshAll} disabled={isRefreshing}>
+                    {isRefreshing ? "Atualizando..." : "Atualizar"}
+                  </button>
+                </div>
 
-          <ul style={{ paddingLeft: 18 }}>
-            {complianceEvents.map((ev) => {
-              const id = ev?.id || `${ev?.timestamp || ""}`;
-              const ts = ev?.timestamp ? new Date(ev.timestamp).toLocaleString() : "";
-              const dev = ev?.deviceId || "";
-              const alias = ev?.alias ? ` - ${ev.alias}` : "";
-              const sev = ev?.severity ? String(ev.severity) : "";
-              const author = ev?.author ? String(ev.author) : "";
-              const content = ev?.content ? String(ev.content) : "";
-              const matches = Array.isArray(ev?.matches) ? ev.matches.join(", ") : "";
+                <div style={{ padding: 14 }}>
+                  <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
+                    Conexões atuais
+                  </div>
 
-              return (
-                <li key={id} style={{ marginBottom: 8 }}>
-                  <strong>❗ {sev}</strong> — {ts} — <span style={{ color: "#333" }}>{dev}{alias}</span>{" "}
-                  <span style={{ color: "#777" }}>| autor: {author}</span>
-                  <div style={{ marginTop: 4, color: "#333" }}>{content}</div>
-                  {matches && <div style={{ marginTop: 2, color: "#777", fontSize: 12 }}>match: {matches}</div>}
-                </li>
-              );
-            })}
-            {complianceEvents.length === 0 && <li>Nenhum evento encontrado.</li>}
-          </ul>
+                  <div className="row" style={{ gap: 10, flexWrap: "wrap" }}>
+                    <div className="card" style={{ minWidth: 260 }}>
+                      <div className="kpi" style={{ fontSize: 18 }}>
+                        {HTTP_BASE}
+                      </div>
+                      <div className="kpi-label">HTTP Backend</div>
+                    </div>
+
+                    <div className="card" style={{ minWidth: 260 }}>
+                      <div className="kpi" style={{ fontSize: 18 }}>
+                        {WS_BASE}
+                      </div>
+                      <div className="kpi-label">WS Backend</div>
+                    </div>
+
+                    <div className="card" style={{ minWidth: 260 }}>
+                      <div className="kpi" style={{ fontSize: 18 }}>
+                        {user?.username || "admin"}
+                      </div>
+                      <div className="kpi-label">Usuário logado</div>
+                    </div>
+                  </div>
+
+                  <div className="muted" style={{ marginTop: 16, fontSize: 12 }}>
+                    Última atualização manual: {lastRefreshLabel}
+                  </div>
+                </div>
+              </section>
+            )}
+          </main>
         </div>
-      )}
-
-      <ScreenViewer deviceId={selectedDeviceId} displayName={selectedDisplayName} />
-
-      <div style={{ marginTop: 24 }}>
-        <h2>Logs</h2>
-        <ul style={{ paddingLeft: 18 }}>
-          {logs.map((log, i) => (
-            <li key={i}>
-              {String(log.timestamp)} - {log.action}
-            </li>
-          ))}
-        </ul>
       </div>
-    </div>
-  );
-}
-
-/**
- * ============================================
- * LoginForm
- * ============================================
- */
-function LoginForm({ onLogin }) {
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-
-  return (
-    <form
-      onSubmit={(e) => {
-        e.preventDefault();
-        onLogin(username, password);
-      }}
-      style={{ padding: 16 }}
-    >
-      <h2>Login Admin</h2>
-
-      <div style={{ display: "flex", flexDirection: "column", gap: 8, maxWidth: 320 }}>
-        <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="Usuário" />
-        <input
-          type="password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          placeholder="Senha"
-        />
-
-        <button type="submit">Entrar</button>
-
-        <div style={{ marginTop: 8, color: "#666", fontSize: 12 }}>Backend: {HTTP_BASE}</div>
-      </div>
-    </form>
+    </>
   );
 }
 
