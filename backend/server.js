@@ -19,6 +19,9 @@ app.use(express.json());
 
 const JWT_SECRET = "supersecretkey";
 
+// ✅ porta configurável (mantém 3001 por padrão)
+const PORT = Number(process.env.PORT || 3001);
+
 // ============================
 // Persistência (data dir)
 // ============================
@@ -335,6 +338,21 @@ function emitPresence(deviceId, online, device) {
 }
 
 // ============================
+// ✅ Serve Admin Console (build)
+// ============================
+// Espera a UI em: backend/public-admin
+const ADMIN_BUILD_DIR = path.join(__dirname, "public-admin");
+const ADMIN_INDEX_HTML = path.join(ADMIN_BUILD_DIR, "index.html");
+
+// Serve arquivos estáticos (JS/CSS/imagens)
+if (fs.existsSync(ADMIN_BUILD_DIR)) {
+  app.use(express.static(ADMIN_BUILD_DIR));
+  console.log(`🖥️  Admin Console build detectado em: ${ADMIN_BUILD_DIR}`);
+} else {
+  console.log(`ℹ️  Admin Console build NÃO encontrado. Esperado em: ${ADMIN_BUILD_DIR}`);
+}
+
+// ============================
 // Auth
 // ============================
 app.post("/api/login", (req, res) => {
@@ -479,6 +497,17 @@ app.get("/api/devices/:id/frame", (req, res) => {
   res.setHeader("Pragma", "no-cache");
   res.setHeader("Expires", "0");
   res.send(buf);
+});
+
+// ============================
+// SPA fallback (React Router / navegação)
+// ============================
+// Qualquer GET que NÃO seja /api/* e exista index.html -> devolve a UI
+app.get(/^\/(?!api\/).*/, (req, res) => {
+  if (!fs.existsSync(ADMIN_INDEX_HTML)) {
+    return res.status(404).send("Admin Console build not found");
+  }
+  res.sendFile(ADMIN_INDEX_HTML);
 });
 
 // ============================
@@ -802,6 +831,7 @@ setInterval(() => {
 // ============================
 // Start
 // ============================
-server.listen(3001, "0.0.0.0", () => {
-  console.log("Backend rodando na porta 3001");
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Backend rodando na porta ${PORT}`);
+  console.log(`UI: http://localhost:${PORT}`);
 });
