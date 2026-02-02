@@ -13,7 +13,7 @@
  *
  * ✅ FIX CROSS-PLATFORM:
  * - Antes: storage/lock hardcoded em C:\ProgramData\... (Windows-only)
- * - Agora: paths por SO + fallback seguro quando global não tiver permissão
+ * - paths por SO + fallback seguro quando global não tiver permissão
  */
 
 const { app, BrowserWindow, dialog, desktopCapturer } = require("electron");
@@ -42,7 +42,7 @@ const AGENT_VERSION = "1.0.5";
  * - macOS: tenta /Library/Application Support/LOOKOUT (global por máquina)
  *   - se sem permissão: fallback para ~/Library/Application Support/LOOKOUT (por usuário)
  *
- * Obs: Se você quiser forçar path (deploy corporativo),
+ * Obs: Se quiser forçar path (deploy corporativo),
  * pode setar env LOOKOUT_BASE_DIR=/caminho/custom
  */
 function ensureDir(dir) {
