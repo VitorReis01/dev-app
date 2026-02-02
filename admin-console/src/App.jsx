@@ -2,6 +2,10 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import BackgroundEye from "./components/BackgroundEye";
 import "./app-shell.css";
 
+// ✅ Assets (adicione os arquivos conforme instrução)
+import imesulLogo from "./assets/imesul.png";
+import vrCreator from "./assets/vr.png";
+
 /**
  * ============================================
  * CONFIG (HTTP + WS)
@@ -40,7 +44,6 @@ function arrayToMapById(list) {
       lastSeen: d.lastSeen ?? null,
       agentVersion: d.agentVersion ?? null,
 
-      // ✅ compliance (para ❗)
       complianceFlag: !!d.complianceFlag,
       complianceCount: Number(d.complianceCount || 0),
       complianceLastAt: d.complianceLastAt ?? null,
@@ -65,9 +68,62 @@ function applyPresencePatch(prevById, patch) {
       online: connected,
       lastSeen: patch.lastSeen ?? prev.lastSeen ?? null,
       agentVersion: patch.agentVersion ?? prev.agentVersion ?? null,
-      // ✅ presence não mexe em compliance
     },
   };
+}
+
+/**
+ * ============================================
+ * MiniModal (para "Criador")
+ * ============================================
+ */
+function Modal({ open, title, onClose, children }) {
+  if (!open) return null;
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,.55)",
+        zIndex: 9999,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 16,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: "min(720px, 96vw)",
+          borderRadius: 14,
+          background: "rgba(18, 18, 22, .92)",
+          border: "1px solid rgba(255,255,255,.10)",
+          boxShadow: "0 20px 80px rgba(0,0,0,.65)",
+          overflow: "hidden",
+        }}
+      >
+        <div
+          style={{
+            padding: 14,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            borderBottom: "1px solid rgba(255,255,255,.08)",
+          }}
+        >
+          <div style={{ fontWeight: 800 }}>{title}</div>
+          <button className="btn" onClick={onClose}>
+            Fechar
+          </button>
+        </div>
+
+        <div style={{ padding: 14 }}>{children}</div>
+      </div>
+    </div>
+  );
 }
 
 /**
@@ -147,12 +203,7 @@ function ScreenViewer({ deviceId, displayName, onClose }) {
         </div>
       </div>
 
-      <div
-        ref={viewerRef}
-        onDoubleClick={enterFullscreen}
-        className="viewer"
-        title="Duplo clique para tela cheia"
-      >
+      <div ref={viewerRef} onDoubleClick={enterFullscreen} className="viewer" title="Duplo clique para tela cheia">
         <img src={frameUrl} alt="screen" className="viewer-img" />
       </div>
     </div>
@@ -174,17 +225,33 @@ function LoginForm({ onLogin }) {
       <div className="app-layer">
         <div className="login-wrap">
           <div className="login-card">
-            <div className="login-brand">
-              <span className="logo-dot">👁️</span>
-              <span>LOOKOUT</span>
+            {/* ✅ Cabeçalho com LOGO IMESUL */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+              <div>
+                <div className="login-brand">
+                  <span className="logo-dot">👁️</span>
+                  <span>LOOKOUT</span>
+                </div>
+                <div className="login-sub">Admin Console</div>
+              </div>
+
+              <img
+                src={imesulLogo}
+                alt="Imesul"
+                style={{
+                  height: 26,
+                  opacity: 0.95,
+                  filter: "drop-shadow(0 8px 20px rgba(0,0,0,.35))",
+                }}
+              />
             </div>
-            <div className="login-sub">Admin Console</div>
 
             <form
               onSubmit={(e) => {
                 e.preventDefault();
                 onLogin(username, password);
               }}
+              style={{ marginTop: 10 }}
             >
               <div className="field">
                 <label>Usuário</label>
@@ -227,7 +294,6 @@ function App() {
 
   const [devicesById, setDevicesById] = useState({});
   const [logs, setLogs] = useState([]);
-
   const [aliasesById, setAliasesById] = useState({});
 
   const [editingDeviceId, setEditingDeviceId] = useState(null);
@@ -242,9 +308,8 @@ function App() {
   const [activeTab, setActiveTab] = useState("devices");
   const [searchTerm, setSearchTerm] = useState("");
 
-  // ✅ Refresh UX
-  const [isRefreshing, setIsRefreshing] = useState(false);
-  const [lastRefreshAt, setLastRefreshAt] = useState(null);
+  // ✅ Modal criador
+  const [showCreator, setShowCreator] = useState(false);
 
   const wsRef = useRef(null);
   const reconnectTimerRef = useRef(null);
@@ -265,7 +330,9 @@ function App() {
   }, [devicesById, searchTerm, aliasesById]);
 
   const kpi = useMemo(() => {
-    let online = 0, offline = 0, conn = 0;
+    let online = 0,
+      offline = 0,
+      conn = 0;
     for (const d of Object.values(devicesById)) {
       const o = isOnline(d);
       if (o) online += 1;
@@ -327,8 +394,6 @@ function App() {
     setAliasesById({});
     setActiveTab("devices");
     setSearchTerm("");
-    setIsRefreshing(false);
-    setLastRefreshAt(null);
 
     setToken(null);
     setUser(null);
@@ -342,7 +407,8 @@ function App() {
   const fetchDevices = async (authToken) => {
     const headers = { Authorization: `Bearer ${authToken}` };
     const res = await fetch(`${HTTP_BASE}/api/devices`, { headers });
-    if (!res.ok) throw new Error("Falha ao buscar /api/devices");
+    if (!res.ok) return;
+
     const list = await res.json();
     setDevicesById(arrayToMapById(list));
   };
@@ -350,14 +416,14 @@ function App() {
   const fetchLogs = async (authToken) => {
     const headers = { Authorization: `Bearer ${authToken}` };
     const res = await fetch(`${HTTP_BASE}/api/logs`, { headers });
-    if (!res.ok) throw new Error("Falha ao buscar /api/logs");
+    if (!res.ok) return;
     setLogs(await res.json());
   };
 
   const fetchAliases = async (authToken) => {
     const headers = { Authorization: `Bearer ${authToken}` };
     const res = await fetch(`${HTTP_BASE}/api/device-aliases`, { headers });
-    if (!res.ok) throw new Error("Falha ao buscar /api/device-aliases");
+    if (!res.ok) return;
 
     const data = await res.json();
     const normalized = {};
@@ -381,48 +447,13 @@ function App() {
     const headers = { Authorization: `Bearer ${authToken}` };
     const q = deviceIdFilter ? `?deviceId=${encodeURIComponent(deviceIdFilter)}` : "";
     const res = await fetch(`${HTTP_BASE}/api/compliance/events${q}`, { headers });
-    if (!res.ok) throw new Error("Falha ao buscar /api/compliance/events");
+    if (!res.ok) return;
     setComplianceEvents(await res.json());
   };
 
   const fetchData = async (authToken) => {
     if (!authToken) return;
     await Promise.all([fetchDevices(authToken), fetchLogs(authToken), fetchAliases(authToken)]);
-  };
-
-  /**
-   * ============================================
-   * REFRESH 
-   * ============================================
-   */
-  const refreshAll = async () => {
-    if (!token) return;
-    if (isRefreshing) return;
-
-    setIsRefreshing(true);
-    try {
-      await fetchData(token);
-
-      const ws = wsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        try {
-          ws.send(JSON.stringify({ type: "get_snapshot" }));
-        } catch (e) {
-          console.error("Erro ao enviar snapshot via WebSocket:", e);
-        }
-      }
-
-      // se painel de compliance estiver aberto, atualiza também
-      if (showCompliance) {
-        await fetchComplianceEvents(token, complianceFilterDeviceId || "");
-      }
-
-      setLastRefreshAt(Date.now());
-    } catch (e) {
-      alert(`Falha ao atualizar: ${e.message || String(e)}`);
-    } finally {
-      setIsRefreshing(false);
-    }
   };
 
   /**
@@ -466,8 +497,7 @@ function App() {
 
       ws.onopen = async () => {
         reconnectAttemptsRef.current = 0;
-        // primeira carga: usa o refreshAll para ter feedback e consistência
-        await refreshAll();
+        await fetchData(token);
       };
 
       ws.onmessage = (e) => {
@@ -490,7 +520,7 @@ function App() {
 
         if (msg.type === "consent_response") {
           alert(`Dispositivo ${msg.deviceId} ${msg.accepted ? "aceitou" : "recusou"} o suporte.`);
-          fetchLogs(token).catch(() => { });
+          fetchLogs(token);
 
           if (msg.accepted) {
             setSelectedDeviceId(normId(msg.deviceId));
@@ -517,7 +547,7 @@ function App() {
           });
 
           if (showCompliance) {
-            fetchComplianceEvents(token, complianceFilterDeviceId || "").catch(() => { });
+            fetchComplianceEvents(token, complianceFilterDeviceId || "");
           }
           return;
         }
@@ -591,11 +621,6 @@ function App() {
     cancelRename();
   };
 
-  /**
-   * ============================================
-   * UI: Login
-   * ============================================
-   */
   if (!token) return <LoginForm onLogin={login} />;
 
   const selectedDisplayName = selectedDeviceId
@@ -606,19 +631,11 @@ function App() {
     setShowCompliance(true);
     const id = normId(deviceId);
     setComplianceFilterDeviceId(id);
-    try {
-      await fetchComplianceEvents(token, id);
-    } catch (e) {
-      alert(`Falha no compliance: ${e.message || String(e)}`);
-    }
+    await fetchComplianceEvents(token, id);
   };
 
   const refreshCompliance = async () => {
-    try {
-      await fetchComplianceEvents(token, complianceFilterDeviceId || "");
-    } catch (e) {
-      alert(`Falha no compliance: ${e.message || String(e)}`);
-    }
+    await fetchComplianceEvents(token, complianceFilterDeviceId || "");
   };
 
   const navigate = (tab) => {
@@ -626,11 +643,26 @@ function App() {
     setSelectedDeviceId(null);
   };
 
-  const lastRefreshLabel = lastRefreshAt ? new Date(lastRefreshAt).toLocaleTimeString() : "—";
-
   return (
     <>
       <BackgroundEye />
+
+      <Modal open={showCreator} title="Criador" onClose={() => setShowCreator(false)}>
+        <div style={{ display: "grid", gap: 12 }}>
+          <div className="muted" style={{ fontSize: 12 }}>
+            Créditos do sistema (discreto, mas visível para quem procurar).
+          </div>
+          <img
+            src={vrCreator}
+            alt="Criador"
+            style={{
+              width: "100%",
+              borderRadius: 12,
+              border: "1px solid rgba(255,255,255,.10)",
+            }}
+          />
+        </div>
+      </Modal>
 
       <div className="app-layer">
         <div className="shell">
@@ -642,42 +674,46 @@ function App() {
             </div>
 
             <nav className="nav">
-              <a
-                className={activeTab === "devices" ? "active" : ""}
-                href="#"
-                onClick={(e) => {
-                  e.preventDefault();
-                  navigate("devices");
-                }}
-              >
+              <a className={activeTab === "devices" ? "active" : ""} href="#" onClick={(e) => (e.preventDefault(), navigate("devices"))}>
                 Dispositivos
               </a>
-
-              <a
-                className={activeTab === "logs" ? "active" : ""}
-                href="#"
-                onClick={(e) => {
-                  e.preventDefault();
-                  navigate("logs");
-                }}
-              >
+              <a className={activeTab === "logs" ? "active" : ""} href="#" onClick={(e) => (e.preventDefault(), navigate("logs"))}>
                 Logs
               </a>
-
-              <a
-                className={activeTab === "settings" ? "active" : ""}
-                href="#"
-                onClick={(e) => {
-                  e.preventDefault();
-                  navigate("settings");
-                }}
-              >
+              <a className={activeTab === "settings" ? "active" : ""} href="#" onClick={(e) => (e.preventDefault(), navigate("settings"))}>
                 Configurações
               </a>
             </nav>
 
+            {/* ✅ Rodapé com LOGO IMESUL + crédito do criador */}
             <div className="sidebar-foot muted" style={{ marginTop: 12, fontSize: 12 }}>
               Backend: {HTTP_BASE}
+
+              <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 10, justifyContent: "space-between" }}>
+                <img
+                  src={imesulLogo}
+                  alt="Imesul"
+                  style={{
+                    height: 22,
+                    opacity: 0.92,
+                    filter: "drop-shadow(0 10px 20px rgba(0,0,0,.35))",
+                  }}
+                />
+
+                <button
+                  className="btn"
+                  onClick={() => setShowCreator(true)}
+                  title="Créditos do criador"
+                  style={{
+                    padding: "6px 10px",
+                    fontSize: 12,
+                    opacity: 0.92,
+                  }}
+                >
+                  Criador
+                </button>
+              </div>
+
               <div style={{ marginTop: 10 }}>
                 <button className="btn" onClick={logout} title="Sair do admin e voltar ao login">
                   Sair
@@ -691,7 +727,7 @@ function App() {
             <div className="title">
               MDM Console
               <div className="muted" style={{ fontSize: 12 }}>
-                Bem-vindo {user?.username} • atualizado: {lastRefreshLabel}
+                Bem-vindo {user?.username}
               </div>
             </div>
 
@@ -710,6 +746,7 @@ function App() {
 
           {/* MAIN */}
           <main className="main">
+            {/* ABA DISPOSITIVOS */}
             {activeTab === "devices" && (
               <>
                 <div className="main-head">
@@ -726,24 +763,19 @@ function App() {
                         setShowCompliance(next);
                         if (next) {
                           setComplianceFilterDeviceId("");
-                          try {
-                            await fetchComplianceEvents(token, "");
-                          } catch (e) {
-                            alert(`Falha no compliance: ${e.message || String(e)}`);
-                          }
+                          await fetchComplianceEvents(token, "");
                         }
                       }}
                     >
                       {showCompliance ? "Fechar Compliance" : "Compliance"}
                     </button>
-
-                    <button className="btn" onClick={refreshAll} disabled={isRefreshing}>
-                      {isRefreshing ? "Atualizando..." : "Atualizar"}
+                    <button className="btn" onClick={() => fetchData(token)}>
+                      Atualizar
                     </button>
                   </div>
                 </div>
 
-                {/* KPI CARDS */}
+                {/* KPI */}
                 <section className="cards">
                   <div className="card">
                     <div className="kpi">{kpi.online}</div>
@@ -828,14 +860,7 @@ function App() {
 
                             <td className="muted">{d.agentVersion ? `v${d.agentVersion}` : "—"}</td>
 
-                            <td className="muted">
-                              {d.lastSeen ? new Date(d.lastSeen).toLocaleTimeString() : "—"}
-                              {flag && d.complianceLastSeverity ? (
-                                <div className="muted" style={{ fontSize: 12 }}>
-                                  {String(d.complianceLastSeverity)}
-                                </div>
-                              ) : null}
-                            </td>
+                            <td className="muted">{d.lastSeen ? new Date(d.lastSeen).toLocaleTimeString() : "—"}</td>
 
                             <td>
                               {!isEditing ? (
@@ -912,33 +937,17 @@ function App() {
                         const id = ev?.id || `${ev?.timestamp || ""}`;
                         const ts = ev?.timestamp ? new Date(ev.timestamp).toLocaleString() : "";
                         const dev = ev?.deviceId || "";
-                        const alias = ev?.alias ? ` - ${ev.alias}` : "";
                         const sev = ev?.severity ? String(ev.severity) : "";
-                        const author = ev?.author ? String(ev.author) : "";
                         const content = ev?.content ? String(ev.content) : "";
-                        const matches = Array.isArray(ev?.matches) ? ev.matches.join(", ") : "";
 
                         return (
                           <li key={id} className="list-item">
                             <div style={{ fontWeight: 800 }}>❗ {sev}</div>
-                            <div className="muted" style={{ fontSize: 12 }}>
-                              {ts}
-                            </div>
+                            <div className="muted" style={{ fontSize: 12 }}>{ts}</div>
                             <div style={{ marginTop: 6 }}>
-                              <span style={{ fontWeight: 700 }}>
-                                {dev}
-                                {alias}
-                              </span>{" "}
-                              <span className="muted" style={{ fontSize: 12 }}>
-                                | autor: {author}
-                              </span>
+                              <span style={{ fontWeight: 700 }}>{dev}</span>
                             </div>
                             <div style={{ marginTop: 6 }}>{content}</div>
-                            {matches && (
-                              <div className="muted" style={{ marginTop: 4, fontSize: 12 }}>
-                                match: {matches}
-                              </div>
-                            )}
                           </li>
                         );
                       })}
@@ -948,14 +957,11 @@ function App() {
                 )}
 
                 {/* VIEWER */}
-                <ScreenViewer
-                  deviceId={selectedDeviceId}
-                  displayName={selectedDisplayName}
-                  onClose={() => setSelectedDeviceId(null)}
-                />
+                <ScreenViewer deviceId={selectedDeviceId} displayName={selectedDisplayName} onClose={() => setSelectedDeviceId(null)} />
               </>
             )}
 
+            {/* ABA LOGS */}
             {activeTab === "logs" && (
               <section className="panel">
                 <div className="panel-head">
@@ -965,18 +971,16 @@ function App() {
                       Eventos do sistema
                     </div>
                   </div>
-                  <button className="btn" onClick={refreshAll} disabled={isRefreshing}>
-                    {isRefreshing ? "Atualizando..." : "Atualizar"}
+                  <button className="btn" onClick={() => fetchLogs(token)}>
+                    Atualizar logs
                   </button>
                 </div>
 
                 <ul className="list">
                   {logs.map((log, i) => (
                     <li key={i} className="list-item">
-                      <span className="muted">
-                        {log?.timestamp ? String(log.timestamp) : log?.ts ? new Date(log.ts).toLocaleString() : ""}
-                      </span>{" "}
-                      — {log?.action ? log.action : log?.msg ? log.msg : JSON.stringify(log)}
+                      <span className="muted">{String(log.timestamp || log.ts || "")}</span> —{" "}
+                      {log.action ? log.action : log.msg ? log.msg : JSON.stringify(log)}
                     </li>
                   ))}
                   {logs.length === 0 && <li className="muted">Sem logs no momento.</li>}
@@ -984,50 +988,28 @@ function App() {
               </section>
             )}
 
+            {/* ABA SETTINGS */}
             {activeTab === "settings" && (
               <section className="panel">
                 <div className="panel-head">
                   <div>
                     <div className="panel-title">Configurações</div>
                     <div className="muted" style={{ fontSize: 12 }}>
-                      Tela administrativa (placeholder).
+                      Área administrativa (placeholder)
                     </div>
                   </div>
-                  <button className="btn" onClick={refreshAll} disabled={isRefreshing}>
-                    {isRefreshing ? "Atualizando..." : "Atualizar"}
-                  </button>
                 </div>
 
                 <div style={{ padding: 14 }}>
-                  <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
-                    Conexões atuais
+                  <div className="muted" style={{ fontSize: 12 }}>
+                    Cliente: <b>Imesul Distribuição</b>
                   </div>
 
-                  <div className="row" style={{ gap: 10, flexWrap: "wrap" }}>
-                    <div className="card" style={{ minWidth: 260 }}>
-                      <div className="kpi" style={{ fontSize: 18 }}>
-                        {HTTP_BASE}
-                      </div>
-                      <div className="kpi-label">HTTP Backend</div>
-                    </div>
-
-                    <div className="card" style={{ minWidth: 260 }}>
-                      <div className="kpi" style={{ fontSize: 18 }}>
-                        {WS_BASE}
-                      </div>
-                      <div className="kpi-label">WS Backend</div>
-                    </div>
-
-                    <div className="card" style={{ minWidth: 260 }}>
-                      <div className="kpi" style={{ fontSize: 18 }}>
-                        {user?.username || "admin"}
-                      </div>
-                      <div className="kpi-label">Usuário logado</div>
-                    </div>
-                  </div>
-
-                  <div className="muted" style={{ marginTop: 16, fontSize: 12 }}>
-                    Última atualização manual: {lastRefreshLabel}
+                  <div style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 12 }}>
+                    <img src={imesulLogo} alt="Imesul" style={{ height: 32, opacity: 0.95 }} />
+                    <button className="btn" onClick={() => setShowCreator(true)}>
+                      Ver créditos do criador
+                    </button>
                   </div>
                 </div>
               </section>
