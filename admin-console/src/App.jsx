@@ -8,14 +8,37 @@ import vrCreator from "./assets/vr.png";
 
 /**
  * ============================================
- * CONFIG (HTTP + WS)
+ * CONFIG (HTTP + WS) - AUTO-DETECT
  * ============================================
+ * Objetivo: funcionar em qualquer PC só abrindo o link:
+ *   http://IP_DO_SERVIDOR:3001
+ * Sem depender de .env apontando pra "localhost".
  */
-const BACKEND_HOST = process.env.REACT_APP_BACKEND_HOST || "localhost";
-const BACKEND_PORT = process.env.REACT_APP_BACKEND_PORT || "3001";
+const FALLBACK_PORT = "3001";
 
-const HTTP_BASE = `http://${BACKEND_HOST}:${BACKEND_PORT}`;
-const WS_BASE = `ws://${BACKEND_HOST}:${BACKEND_PORT}`;
+function getBackendBaseFromWindow() {
+  try {
+    const { protocol, hostname, port } = window.location;
+
+    const isHttps = protocol === "https:";
+    const httpProto = isHttps ? "https" : "http";
+    const wsProto = isHttps ? "wss" : "ws";
+
+    const p = port && String(port).trim() ? String(port).trim() : FALLBACK_PORT;
+
+    return {
+      HTTP_BASE: `${httpProto}://${hostname}:${p}`,
+      WS_BASE: `${wsProto}://${hostname}:${p}`,
+    };
+  } catch {
+    return {
+      HTTP_BASE: `http://localhost:${FALLBACK_PORT}`,
+      WS_BASE: `ws://localhost:${FALLBACK_PORT}`,
+    };
+  }
+}
+
+const { HTTP_BASE, WS_BASE } = getBackendBaseFromWindow();
 
 /**
  * ============================================
@@ -643,6 +666,11 @@ function App() {
     setSelectedDeviceId(null);
   };
 
+  /**
+   * ============================================
+   * UI
+   * ============================================
+   */
   return (
     <>
       <BackgroundEye />
@@ -673,16 +701,31 @@ function App() {
               LOOKOUT
             </div>
 
+            {/* ✅ NAV sem <a href="#"> pra não gerar warning */}
             <nav className="nav">
-              <a className={activeTab === "devices" ? "active" : ""} href="#" onClick={(e) => (e.preventDefault(), navigate("devices"))}>
+              <button
+                type="button"
+                className={activeTab === "devices" ? "active" : ""}
+                onClick={() => navigate("devices")}
+              >
                 Dispositivos
-              </a>
-              <a className={activeTab === "logs" ? "active" : ""} href="#" onClick={(e) => (e.preventDefault(), navigate("logs"))}>
+              </button>
+
+              <button
+                type="button"
+                className={activeTab === "logs" ? "active" : ""}
+                onClick={() => navigate("logs")}
+              >
                 Logs
-              </a>
-              <a className={activeTab === "settings" ? "active" : ""} href="#" onClick={(e) => (e.preventDefault(), navigate("settings"))}>
+              </button>
+
+              <button
+                type="button"
+                className={activeTab === "settings" ? "active" : ""}
+                onClick={() => navigate("settings")}
+              >
                 Configurações
-              </a>
+              </button>
             </nav>
 
             {/* ✅ Rodapé com LOGO IMESUL + crédito do criador */}
@@ -701,6 +744,7 @@ function App() {
                 />
 
                 <button
+                  type="button"
                   className="btn"
                   onClick={() => setShowCreator(true)}
                   title="Créditos do criador"
@@ -715,7 +759,7 @@ function App() {
               </div>
 
               <div style={{ marginTop: 10 }}>
-                <button className="btn" onClick={logout} title="Sair do admin e voltar ao login">
+                <button type="button" className="btn" onClick={logout} title="Sair do admin e voltar ao login">
                   Sair
                 </button>
               </div>
@@ -757,6 +801,7 @@ function App() {
 
                   <div className="row" style={{ gap: 8 }}>
                     <button
+                      type="button"
                       className={`btn ${showCompliance ? "red" : ""}`}
                       onClick={async () => {
                         const next = !showCompliance;
@@ -769,7 +814,8 @@ function App() {
                     >
                       {showCompliance ? "Fechar Compliance" : "Compliance"}
                     </button>
-                    <button className="btn" onClick={() => fetchData(token)}>
+
+                    <button type="button" className="btn" onClick={() => fetchData(token)}>
                       Atualizar
                     </button>
                   </div>
@@ -850,7 +896,7 @@ function App() {
 
                             <td>
                               {flag ? (
-                                <button className="badge-btn" onClick={() => openCompliancePanel(deviceId)} title="Ver eventos">
+                                <button type="button" className="badge-btn" onClick={() => openCompliancePanel(deviceId)} title="Ver eventos">
                                   ❗ {count > 0 ? `(${count})` : ""}
                                 </button>
                               ) : (
@@ -865,13 +911,13 @@ function App() {
                             <td>
                               {!isEditing ? (
                                 <div className="row" style={{ gap: 8 }}>
-                                  <button className="btn red" onClick={() => requestSupport(d.id)} disabled={!online}>
+                                  <button type="button" className="btn red" onClick={() => requestSupport(d.id)} disabled={!online}>
                                     Suporte
                                   </button>
-                                  <button className="btn" onClick={() => setSelectedDeviceId(d.id)} disabled={!online}>
+                                  <button type="button" className="btn" onClick={() => setSelectedDeviceId(d.id)} disabled={!online}>
                                     Ver tela
                                   </button>
-                                  <button className="btn" onClick={() => startRename(d.id)}>
+                                  <button type="button" className="btn" onClick={() => startRename(d.id)}>
                                     Renomear
                                   </button>
                                 </div>
@@ -884,10 +930,10 @@ function App() {
                                     placeholder="Ex: Loja 03 / Financeiro"
                                     autoFocus
                                   />
-                                  <button className="btn red" onClick={() => saveRename(d.id)}>
+                                  <button type="button" className="btn red" onClick={() => saveRename(d.id)}>
                                     Salvar
                                   </button>
-                                  <button className="btn" onClick={cancelRename}>
+                                  <button type="button" className="btn" onClick={cancelRename}>
                                     Cancelar
                                   </button>
                                 </div>
@@ -926,7 +972,7 @@ function App() {
                           placeholder="Filtrar por deviceId (opcional)"
                           style={{ width: 260 }}
                         />
-                        <button className="btn" onClick={refreshCompliance}>
+                        <button type="button" className="btn" onClick={refreshCompliance}>
                           Atualizar
                         </button>
                       </div>
@@ -943,7 +989,9 @@ function App() {
                         return (
                           <li key={id} className="list-item">
                             <div style={{ fontWeight: 800 }}>❗ {sev}</div>
-                            <div className="muted" style={{ fontSize: 12 }}>{ts}</div>
+                            <div className="muted" style={{ fontSize: 12 }}>
+                              {ts}
+                            </div>
                             <div style={{ marginTop: 6 }}>
                               <span style={{ fontWeight: 700 }}>{dev}</span>
                             </div>
@@ -971,7 +1019,7 @@ function App() {
                       Eventos do sistema
                     </div>
                   </div>
-                  <button className="btn" onClick={() => fetchLogs(token)}>
+                  <button type="button" className="btn" onClick={() => fetchLogs(token)}>
                     Atualizar logs
                   </button>
                 </div>
@@ -1007,7 +1055,7 @@ function App() {
 
                   <div style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 12 }}>
                     <img src={imesulLogo} alt="Imesul" style={{ height: 32, opacity: 0.95 }} />
-                    <button className="btn" onClick={() => setShowCreator(true)}>
+                    <button type="button" className="btn" onClick={() => setShowCreator(true)}>
                       Ver créditos do criador
                     </button>
                   </div>
