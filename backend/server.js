@@ -8,7 +8,6 @@ const bcrypt = require("bcryptjs");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
-const crypto = require("crypto");
 
 const app = express();
 const server = http.createServer(app);
@@ -16,10 +15,49 @@ const wss = new WebSocket.Server({ server });
 
 app.use(cors());
 app.use(express.json());
+app.set("etag", false);
+
+// ============================
+// LOGS (memória - ring buffer)
+// ============================
+const MAX_LOGS = 500;
+const logs = []; // { ts, level, msg, meta }
+
+function addLog(level, msg, meta) {
+  const entry = {
+    ts: Date.now(),
+    level: String(level || "INFO"),
+    msg: String(msg || ""),
+    meta: meta ?? null,
+  };
+  logs.push(entry);
+  if (logs.length > MAX_LOGS) logs.shift();
+
+  // também vai pro console (ajuda no NSSM/serviço)
+  try {
+    console.log(`[${new Date(entry.ts).toISOString()}] ${entry.level}: ${entry.msg}`, entry.meta ?? "");
+  } catch { }
+}
+
+// ============================
+// API GUARD: /api nunca pode cair no SPA fallback
+// ============================
+app.use("/api", (req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
+
+// ============================
+// HTTP LOG (somente /api)
+// ============================
+app.use((req, _res, next) => {
+  if (req.path && String(req.path).startsWith("/api/")) {
+    addLog("INFO", `HTTP ${req.method} ${req.path}`, { ip: req.ip });
+  }
+  next();
+});
 
 const JWT_SECRET = "supersecretkey";
-
-// ✅ porta configurável (mantém 3001 por padrão)
 const PORT = Number(process.env.PORT || 3001);
 
 // ============================
@@ -43,8 +81,7 @@ function loadJsonSafe(filePath, fallback) {
   try {
     if (!fs.existsSync(filePath)) return fallback;
     const raw = fs.readFileSync(filePath, "utf8");
-    const parsed = JSON.parse(raw);
-    return parsed ?? fallback;
+    return JSON.parse(raw) ?? fallback;
   } catch {
     return fallback;
   }
@@ -60,55 +97,42 @@ function saveJsonSafe(filePath, obj) {
   }
 }
 
-// { [deviceId]: { label, updatedAt } }
 let deviceAliases = loadJsonSafe(ALIASES_PATH, {});
 
-function getAliasLabel(deviceId) {
-  const entry = deviceAliases[String(deviceId || "").trim()];
-  const label = entry?.label ? String(entry.label).trim() : "";
-  return label || "";
-}
-
 // ============================
-// Persistência (compliance events)
+// Compliance persistence
 // ============================
-// ✅ Persistimos todos os eventos aqui (MVP produção LAN)
 const COMPLIANCE_EVENTS_PATH = path.join(DATA_DIR, "compliance-events.json");
-
-// [{ id, deviceId, alias, author, context, timestamp, content, matches, severity }]
 let complianceEvents = loadJsonSafe(COMPLIANCE_EVENTS_PATH, []);
 if (!Array.isArray(complianceEvents)) complianceEvents = [];
 
-// ✅ Agregado por device (para alimentar ❗)
-const complianceByDevice = new Map(); // deviceId -> { count, lastAt, lastSeverity }
+const complianceByDevice = new Map();
 
 function recomputeComplianceAgg() {
   complianceByDevice.clear();
   for (const ev of complianceEvents) {
-    const deviceId = String(ev?.deviceId || "").trim();
-    if (!deviceId) continue;
+    const id = String(ev?.deviceId || "").trim();
+    if (!id) continue;
 
-    const prev = complianceByDevice.get(deviceId) || {
+    const prev = complianceByDevice.get(id) || {
       count: 0,
       lastAt: 0,
       lastSeverity: null,
     };
 
-    const ts = Number(ev?.timestamp || 0);
     prev.count += 1;
-    if (ts >= prev.lastAt) {
-      prev.lastAt = ts;
+    if (Number(ev?.timestamp || 0) >= prev.lastAt) {
+      prev.lastAt = Number(ev?.timestamp || 0);
       prev.lastSeverity = ev?.severity ?? prev.lastSeverity;
     }
 
-    complianceByDevice.set(deviceId, prev);
+    complianceByDevice.set(id, prev);
   }
 }
 recomputeComplianceAgg();
 
 function getComplianceState(deviceId) {
-  const id = String(deviceId || "").trim();
-  const agg = complianceByDevice.get(id);
+  const agg = complianceByDevice.get(String(deviceId || "").trim());
   if (!agg) {
     return {
       complianceFlag: false,
@@ -126,155 +150,30 @@ function getComplianceState(deviceId) {
 }
 
 // ============================
-// Compliance detector (MVP)
-// ============================
-// ✅ normalização para pegar variações (caps, símbolos, números, etc.)
-function normalizeText(s) {
-  const raw = String(s || "");
-  const lower = raw.toLowerCase();
-
-  // remove acentos
-  const noAcc = lower.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-
-  // troca leetspeak e símbolos comuns
-  const leet = noAcc
-    .replace(/@/g, "a")
-    .replace(/\$/g, "s")
-    .replace(/0/g, "o")
-    .replace(/1/g, "i")
-    .replace(/3/g, "e")
-    .replace(/4/g, "a")
-    .replace(/5/g, "s")
-    .replace(/7/g, "t");
-
-  // remove pontuação/símbolos (mantém espaço)
-  const cleaned = leet.replace(/[^a-z0-9\s]/g, " ");
-
-  // colapsa espaços
-  return cleaned.replace(/\s+/g, " ").trim();
-}
-
-// ✅ listas principais (você pode expandir depois sem mudar lógica)
-const COMPLIANCE_TRIGGERS = [
-  // 💰 por fora / pagamento direto
-  "pode mandar o valor direto pra mim",
-  "manda pra minha conta",
-  "acerta por fora",
-  "acerta isso por fora",
-  "faz o pix nesse outro numero",
-  "nao precisa passar pela empresa",
-  "esse valor nao precisa ir na nota",
-  "sem envolver o financeiro",
-  "esse pagamento nao precisa aparecer",
-  "isso nao entra no caixa da empresa",
-  "comissao por fora",
-  "parte pra mim",
-  "fica uma parte pra mim",
-  "a diferenca e minha",
-  "esse dinheiro nao aparece",
-
-  // 🧾 nota/sistema
-  "nao lanca isso agora",
-  "melhor nao colocar no sistema",
-  "coloca outro valor na nota",
-  "nao precisa gerar nf",
-  "nao registra isso",
-  "fora do sistema",
-  "sem nota",
-
-  // 🤝 conluio
-  "fica so entre nos",
-  "a empresa nao precisa saber",
-  "nao comenta isso com ninguem",
-  "isso e um acordo nosso",
-
-  // 🤬 palavrões / ofensas (amostra MVP)
-  "porra",
-  "caralho",
-  "merda",
-  "bosta",
-  "foda se",
-  "vai tomar no cu",
-  "vai se foder",
-  "fdp",
-  "filho da puta",
-  "arrombado",
-  "babaca",
-  "idiota",
-  "imbecil",
-  "otario",
-  "trouxa",
-  "pqp",
-  "vtnc",
-];
-
-function detectCompliance(content) {
-  const norm = normalizeText(content);
-
-  const matches = [];
-  for (const t of COMPLIANCE_TRIGGERS) {
-    const nt = normalizeText(t);
-    if (!nt) continue;
-    if (norm.includes(nt)) matches.push(t);
-  }
-
-  if (matches.length === 0) {
-    return { suspicious: false, matches: [], severity: null };
-  }
-
-  // ✅ severidade MVP
-  // high: por fora / dinheiro / comissão / dividir / pix
-  // medium: sistema/nota
-  // low: palavrão/ofensa
-  const normJoined = matches.map((m) => normalizeText(m)).join(" | ");
-  let severity = "low";
-
-  if (
-    normJoined.includes("por fora") ||
-    normJoined.includes("pix") ||
-    normJoined.includes("dinheiro") ||
-    normJoined.includes("comissao") ||
-    normJoined.includes("parte pra mim") ||
-    normJoined.includes("a diferenca e minha")
-  ) {
-    severity = "high";
-  } else if (
-    normJoined.includes("nota") ||
-    normJoined.includes("sistema") ||
-    normJoined.includes("nf") ||
-    normJoined.includes("nao registra") ||
-    normJoined.includes("fora do sistema")
-  ) {
-    severity = "medium";
-  }
-
-  return { suspicious: true, matches, severity };
-}
-
-// ============================
-// In-memory data (MVP)
+// Admin users (seed)
 // ============================
 const adminsSeed = [
-  { id: 1, username: "admin", passwordHash: bcrypt.hashSync("admin123", 10) },
+  {
+    id: 1,
+    username: "admin",
+    passwordHash: bcrypt.hashSync("@ims067!", 10),
+  },
 ];
 
-// ✅ Devices começam vazios (sem seed de teste)
-const devices = [];
+// ============================
+// In-memory
+// ============================
+const devices = []; // { id, connected, lastSeen, agentVersion }
+const wsAgentsByDeviceId = new Map();
 
-// logs (MVP)
-const logs = [];
+// guarda o último frame por deviceId (pode ser dataURL ou base64 puro)
+const lastFrameByDevice = Object.create(null);
 
-// WS sessions
-const wsAgentsByDeviceId = new Map(); // deviceId -> ws
-const lastFrameByDevice = {}; // { [deviceId]: "data:image/jpeg;base64,..." }
+// throttle p/ frames
+const lastFrameSentAtByDevice = Object.create(null);
+const MIN_FRAME_INTERVAL_MS =250; // 4fps máximo
 
-// throttle por device
-const lastFrameSentAtByDevice = {}; // { [deviceId]: number(ms) }
-const MIN_FRAME_INTERVAL_MS = 120;
-
-// Presence TTL (anti-zumbi)
-const PRESENCE_TTL_MS = 15_000;
-const HEARTBEAT_TYPE = "ping";
+const PRESENCE_TTL_MS = 15000;
 
 // ============================
 // Helpers
@@ -287,69 +186,55 @@ function normDeviceId(id) {
   return String(id || "").trim();
 }
 
-function findDevice(deviceId) {
-  return devices.find((d) => d.id === deviceId);
+function findDevice(id) {
+  const norm = normDeviceId(id);
+  return devices.find((d) => d.id === norm);
 }
 
-function toDeviceDTO(d) {
-  const alias = getAliasLabel(d.id);
-  const comp = getComplianceState(d.id);
-
-  return {
-    id: d.id,
-    name: alias || d.name, // ✅ aplica alias no REST
-    user: d.user, // pode manter "unknown" (UI ignora)
-    connected: !!d.connected,
-    online: !!d.connected,
-    lastSeen: d.lastSeen,
-    agentVersion: d.agentVersion,
-
-    // ✅ compliance fields para ❗
-    complianceFlag: comp.complianceFlag,
-    complianceCount: comp.complianceCount,
-    complianceLastAt: comp.complianceLastAt,
-    complianceLastSeverity: comp.complianceLastSeverity,
-  };
+function upsertDevice(id) {
+  const deviceId = normDeviceId(id);
+  let d = findDevice(deviceId);
+  if (!d) {
+    d = { id: deviceId, connected: false, lastSeen: null, agentVersion: null };
+    devices.push(d);
+  }
+  return d;
 }
 
-function safeSend(ws, payloadObj) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-  ws.send(JSON.stringify(payloadObj));
-  return true;
+function safeSend(ws, obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
+    return true;
+  }
+  return false;
 }
 
-function broadcastToAdmins(payloadObj) {
-  wss.clients.forEach((client) => {
-    if (client.isAdmin && client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify(payloadObj));
+function broadcastToAdmins(obj) {
+  wss.clients.forEach((c) => {
+    if (c.isAdmin && c.readyState === WebSocket.OPEN) {
+      c.send(JSON.stringify(obj));
     }
   });
 }
 
-function emitPresence(deviceId, online, device) {
-  broadcastToAdmins({
-    type: "device_presence",
-    deviceId,
-    online: !!online,
-    lastSeen: device?.lastSeen ?? null,
-    agentVersion: device?.agentVersion ?? null,
-    ts: nowMs(),
-  });
+function stripDataUrlToBase64(maybeDataUrl) {
+  const s = String(maybeDataUrl || "");
+  const m = s.match(/^data:(image\/\w+);base64,(.*)$/);
+  if (m) return { mime: m[1], base64: m[2], isDataUrl: true, raw: s };
+  return { mime: "image/jpeg", base64: s, isDataUrl: false, raw: s };
 }
 
 // ============================
-// ✅ Serve Admin Console (build)
+// ✅ ADMIN CONSOLE (React build) (ANTES do fallback)
 // ============================
-// Espera a UI em: backend/public-admin
-const ADMIN_BUILD_DIR = path.join(__dirname, "public-admin");
+const ADMIN_BUILD_DIR = path.join(__dirname, "..", "admin-console", "build");
 const ADMIN_INDEX_HTML = path.join(ADMIN_BUILD_DIR, "index.html");
 
-// Serve arquivos estáticos (JS/CSS/imagens)
 if (fs.existsSync(ADMIN_BUILD_DIR)) {
+  addLog("INFO", "Admin Console build detectado", { dir: ADMIN_BUILD_DIR });
   app.use(express.static(ADMIN_BUILD_DIR));
-  console.log(`🖥️  Admin Console build detectado em: ${ADMIN_BUILD_DIR}`);
 } else {
-  console.log(`ℹ️  Admin Console build NÃO encontrado. Esperado em: ${ADMIN_BUILD_DIR}`);
+  addLog("ERROR", "Admin Console build NÃO encontrado", { dir: ADMIN_BUILD_DIR });
 }
 
 // ============================
@@ -360,150 +245,189 @@ app.post("/api/login", (req, res) => {
   const admin = adminsSeed.find((a) => a.username === username);
 
   if (!admin || !bcrypt.compareSync(String(password || ""), admin.passwordHash)) {
+    addLog("WARN", "Login inválido", { username: String(username || "") });
     return res.status(401).json({ error: "Credenciais inválidas" });
   }
 
-  const token = jwt.sign({ id: admin.id, username: admin.username }, JWT_SECRET, { expiresIn: "1h" });
+  const token = jwt.sign({ id: admin.id, username: admin.username }, JWT_SECRET, {
+    expiresIn: "1h",
+  });
+
+  addLog("INFO", "Login OK", { username: admin.username });
+
   res.json({ token, user: { id: admin.id, username: admin.username } });
 });
 
 function authenticateAdmin(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: "Token necessário" });
+  const auth = req.headers.authorization;
+  if (!auth) return res.status(401).json({ error: "Token necessário" });
 
-  const token = authHeader.replace("Bearer ", "");
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.admin = decoded;
+    req.admin = jwt.verify(auth.replace("Bearer ", ""), JWT_SECRET);
     next();
   } catch {
-    res.status(401).json({ error: "Token inválido" });
+    return res.status(401).json({ error: "Token inválido" });
+  }
+}
+
+function getBearerToken(req) {
+  const auth = req.headers.authorization || "";
+  if (auth.startsWith("Bearer ")) return auth.slice("Bearer ".length).trim();
+  return "";
+}
+
+// aceita: Authorization: Bearer ...  OU  ?token=...
+function authenticateAdminFlex(req, res, next) {
+  const tokenFromHeader = getBearerToken(req);
+  const tokenFromQuery = String(req.query?.token || "").trim();
+
+  const token = tokenFromHeader || tokenFromQuery;
+  if (!token) return res.status(401).json({ error: "Token necessário" });
+
+  try {
+    req.admin = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ error: "Token inválido" });
   }
 }
 
 // ============================
 // REST
 // ============================
-app.get("/api/devices", authenticateAdmin, (req, res) => {
-  res.json(devices.map(toDeviceDTO));
+
+// lista devices (já com compliance e status)
+app.get("/api/devices", authenticateAdmin, (_req, res) => {
+  const out = devices.map((d) => {
+    const comp = getComplianceState(d.id);
+    const connected = !!d.connected;
+    return {
+      id: d.id,
+      deviceId: d.id,
+      name: d.id,
+      connected,
+      online: connected,
+      lastSeen: d.lastSeen,
+      agentVersion: d.agentVersion,
+      ...comp,
+    };
+  });
+  res.json(out);
 });
 
-app.get("/api/logs", authenticateAdmin, (req, res) => {
+// logs (agora sempre útil)
+app.get("/api/logs", authenticateAdmin, (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
   res.json(logs);
 });
 
-// ✅ ALIASES
-app.get("/api/device-aliases", authenticateAdmin, (req, res) => {
+// ✅ rota única do frame (1 imagem JPEG)
+app.get("/api/devices/:deviceId/frame", authenticateAdminFlex, (req, res) => {
+  const deviceId = normDeviceId(req.params.deviceId);
+  const frameRaw = lastFrameByDevice[deviceId];
+
+  if (!frameRaw) return res.status(404).send("No frame");
+
+  const info = stripDataUrlToBase64(frameRaw);
+
+  try {
+    const buf = Buffer.from(info.base64, "base64");
+    res.setHeader("Content-Type", info.mime || "image/jpeg");
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    return res.end(buf);
+  } catch {
+    return res.status(500).send("Invalid frame format");
+  }
+});
+
+// ✅ MJPEG (stream estilo vídeo)
+app.get("/api/devices/:deviceId/mjpeg", authenticateAdminFlex, (req, res) => {
+  const deviceId = normDeviceId(req.params.deviceId);
+
+  res.writeHead(200, {
+    "Content-Type": "multipart/x-mixed-replace; boundary=frame",
+    "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+    Pragma: "no-cache",
+    Expires: "0",
+    Connection: "close",
+  });
+
+  let alive = true;
+  req.on("close", () => {
+    alive = false;
+    clearInterval(timer);
+    try {
+      res.end();
+    } catch { }
+  });
+
+  const timer = setInterval(() => {
+    if (!alive) return;
+
+    const frameRaw = lastFrameByDevice[deviceId];
+    if (!frameRaw) return;
+
+    const info = stripDataUrlToBase64(frameRaw);
+
+    let buf;
+    try {
+      buf = Buffer.from(info.base64, "base64");
+    } catch {
+      return;
+    }
+
+    res.write(`--frame\r\n`);
+    res.write(`Content-Type: ${info.mime || "image/jpeg"}\r\n`);
+    res.write(`Content-Length: ${buf.length}\r\n\r\n`);
+    res.write(buf);
+    res.write(`\r\n`);
+  }, 120); // ~8fps
+});
+
+// aliases
+app.get("/api/device-aliases", authenticateAdmin, (_req, res) => {
   res.json(deviceAliases);
 });
 
 app.put("/api/device-aliases/:deviceId", authenticateAdmin, (req, res) => {
-  const deviceId = normDeviceId(req.params.deviceId);
-  if (!deviceId) return res.status(400).json({ error: "deviceId inválido" });
+  const id = normDeviceId(req.params.deviceId);
+  const label = typeof req.body?.label === "string" ? req.body.label.trim() : "";
 
-  const label = String(req.body?.label ?? "").trim();
+  if (!id) return res.status(400).json({ error: "deviceId inválido" });
 
-  // label vazio => remove alias
-  if (!label) {
-    if (deviceAliases[deviceId]) {
-      delete deviceAliases[deviceId];
-      const okRemove = saveJsonSafe(ALIASES_PATH, deviceAliases);
-      if (!okRemove) return res.status(500).json({ error: "Falha ao persistir alias" });
-    }
-    return res.json({ ok: true, deviceId, label: "" });
-  }
+  deviceAliases[id] = { label, updatedAt: new Date().toISOString() };
+  saveJsonSafe(ALIASES_PATH, deviceAliases);
 
-  deviceAliases[deviceId] = {
-    label,
-    updatedAt: nowMs(),
-  };
-
-  const ok = saveJsonSafe(ALIASES_PATH, deviceAliases);
-  if (!ok) return res.status(500).json({ error: "Falha ao persistir alias" });
-
-  res.json({ ok: true, deviceId, label });
+  res.json({ ok: true, deviceId: id, ...deviceAliases[id] });
 });
 
-// ✅ COMPLIANCE: listar eventos (com filtro por deviceId)
+// ✅ compliance events (pra UI)
 app.get("/api/compliance/events", authenticateAdmin, (req, res) => {
-  const deviceId = normDeviceId(req.query?.deviceId);
-  const list = deviceId ? complianceEvents.filter((e) => e.deviceId === deviceId) : complianceEvents;
-  res.json(list);
-});
+  const filterId = String(req.query?.deviceId || "").trim();
+  const out = filterId
+    ? complianceEvents.filter((e) => String(e?.deviceId || "").trim() === filterId)
+    : complianceEvents;
 
-// ✅ COMPLIANCE: criar evento (manual/teste e integração futura do agent)
-app.post("/api/compliance/events", authenticateAdmin, (req, res) => {
-  const deviceId = normDeviceId(req.body?.deviceId);
-  const context = String(req.body?.context ?? "").trim();
-  const content = String(req.body?.content ?? "").trim();
-  const author = String(req.admin?.username ?? "admin").trim();
-
-  if (!deviceId) return res.status(400).json({ error: "deviceId obrigatório" });
-  if (!content) return res.status(400).json({ error: "content obrigatório" });
-
-  const { suspicious, matches, severity } = detectCompliance(content);
-
-  // ✅ sempre registra (auditoria), mas marca suspeito quando bater
-  const ev = {
-    id: `cev_${nowMs()}_${crypto.randomBytes(8).toString("hex")}`,
-    deviceId,
-    alias: getAliasLabel(deviceId) || null,
-    author,
-    context: context || null,
-    timestamp: nowMs(),
-    content,
-    matches,
-    severity: suspicious ? severity : null,
-    suspicious: !!suspicious,
-  };
-
-  complianceEvents.push(ev);
-  const ok = saveJsonSafe(COMPLIANCE_EVENTS_PATH, complianceEvents);
-  if (!ok) return res.status(500).json({ error: "Falha ao persistir compliance event" });
-
-  if (suspicious) {
-    // ✅ atualiza agregado do device
-    const prev = complianceByDevice.get(deviceId) || { count: 0, lastAt: 0, lastSeverity: null };
-    prev.count += 1;
-    prev.lastAt = ev.timestamp;
-    prev.lastSeverity = ev.severity;
-    complianceByDevice.set(deviceId, prev);
-
-    // ✅ avisa admins em realtime para subir o ❗ sem F5
-    broadcastToAdmins({
-      type: "compliance_event",
-      deviceId,
-      count: prev.count,
-      severity: ev.severity,
-      ts: ev.timestamp,
-    });
-  }
-
-  return res.json({ ok: true, suspicious, event: ev });
-});
-
-// endpoint HTTP pra buscar a tela (fallback / debug)
-app.get("/api/devices/:id/frame", (req, res) => {
-  const deviceId = normDeviceId(req.params.id);
-  const jpeg = lastFrameByDevice[deviceId];
-  if (!jpeg) return res.status(404).send("no frame");
-
-  const base64 = String(jpeg).split(",")[1];
-  if (!base64) return res.status(500).send("invalid frame");
-
-  const buf = Buffer.from(base64, "base64");
-  res.setHeader("Content-Type", "image/jpeg");
-  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("Expires", "0");
-  res.send(buf);
+  res.json([...out].sort((a, b) => Number(b?.timestamp || 0) - Number(a?.timestamp || 0)));
 });
 
 // ============================
-// SPA fallback (React Router / navegação)
+// ✅ API 404 JSON (depois de TODAS as rotas /api)
 // ============================
-// Qualquer GET que NÃO seja /api/* e exista index.html -> devolve a UI
-app.get(/^\/(?!api\/).*/, (req, res) => {
+app.use("/api", (req, res) => {
+  res.status(404).json({
+    error: "API route not found",
+    method: req.method,
+    path: req.originalUrl,
+  });
+});
+
+// ============================
+// ✅ SPA fallback (NO FINAL)
+// ============================
+app.get(/^\/(?!api\/).*/, (_req, res) => {
   if (!fs.existsSync(ADMIN_INDEX_HTML)) {
     return res.status(404).send("Admin Console build not found");
   }
@@ -511,327 +435,240 @@ app.get(/^\/(?!api\/).*/, (req, res) => {
 });
 
 // ============================
-// WebSocket
-// ============================
-function parseQuery(reqUrl) {
-  const raw = reqUrl || "";
-  const qs = raw.startsWith("/?") ? raw.slice(2) : raw.replace("/", "");
-  return new URLSearchParams(qs);
-}
-
-function verifyAdminToken(token) {
-  if (!token) throw new Error("missing token");
-  return jwt.verify(token, JWT_SECRET);
-}
-
-function sendDevicesSnapshot(ws) {
-  safeSend(ws, {
-    type: "devices_snapshot",
-    devices: devices.map((d) => {
-      const alias = getAliasLabel(d.id);
-      const comp = getComplianceState(d.id);
-
-      return {
-        deviceId: d.id,
-        name: alias || d.name,
-        online: !!d.connected,
-        connected: !!d.connected,
-        lastSeen: d.lastSeen,
-        agentVersion: d.agentVersion,
-
-        // ✅ compliance fields para UI
-        complianceFlag: comp.complianceFlag,
-        complianceCount: comp.complianceCount,
-        complianceLastAt: comp.complianceLastAt,
-        complianceLastSeverity: comp.complianceLastSeverity,
-      };
-    }),
-    ts: nowMs(),
-  });
-}
-
-function handleAgent(ws, deviceId, params) {
-  let d = findDevice(deviceId);
-  if (!d) {
-    d = {
-      id: deviceId,
-      name: deviceId, // base
-      user: "unknown",
-      connected: false,
-      lastSeen: null,
-      agentVersion: null,
-    };
-    devices.push(d);
-    console.log(`🆕 Registrando novo dispositivo automaticamente: ${deviceId}`);
-  }
-
-  const agentVersion = params.get("v") || null;
-
-  d.connected = true;
-  d.lastSeen = nowMs();
-  if (agentVersion) d.agentVersion = agentVersion;
-
-  wsAgentsByDeviceId.set(deviceId, ws);
-
-  ws.isAgent = true;
-  ws.deviceId = deviceId;
-
-  console.log(`✅ Dispositivo ${deviceId} conectado (agent)`);
-  emitPresence(deviceId, true, d);
-
-  ws.on("message", (msg) => {
-    let data;
-    try {
-      data = JSON.parse(msg.toString());
-    } catch {
-      return;
-    }
-
-    if (data?.type === HEARTBEAT_TYPE) {
-      const dev = findDevice(deviceId);
-      if (dev) dev.lastSeen = nowMs();
-      safeSend(ws, { type: "pong", ts: nowMs() });
-      return;
-    }
-
-    if (data.type === "consent_response") {
-      logs.push({
-        deviceId,
-        action: "consent_response",
-        accepted: !!data.accepted,
-        timestamp: new Date(),
-      });
-
-      broadcastToAdmins({
-        type: "consent_response",
-        deviceId,
-        accepted: !!data.accepted,
-      });
-
-      return;
-    }
-
-    if (data.type === "screen_frame") {
-      if (data.deviceId && typeof data.jpeg === "string") {
-        const fid = normDeviceId(data.deviceId);
-
-        lastFrameByDevice[fid] = data.jpeg;
-
-        const now = nowMs();
-        const last = lastFrameSentAtByDevice[fid] || 0;
-        if (now - last < MIN_FRAME_INTERVAL_MS) return;
-        lastFrameSentAtByDevice[fid] = now;
-
-        broadcastToAdmins({
-          type: "screen_frame",
-          deviceId: fid,
-          jpeg: data.jpeg,
-          ts: data.ts || now,
-        });
-      }
-      return;
-    }
-
-    // ✅ FUTURO (texto capturado): agent pode enviar {type:"text_captured", author, context, content}
-    // MVP: se bater em compliance => cria evento e sobe ❗
-    if (data.type === "text_captured" && typeof data.content === "string") {
-      const content = String(data.content || "").trim();
-      if (!content) return;
-
-      const author = String(data.author || "unknown").trim();
-      const context = String(data.context || "agent").trim();
-
-      const { suspicious, matches, severity } = detectCompliance(content);
-
-      const ev = {
-        id: `cev_${nowMs()}_${crypto.randomBytes(8).toString("hex")}`,
-        deviceId,
-        alias: getAliasLabel(deviceId) || null,
-        author,
-        context,
-        timestamp: nowMs(),
-        content,
-        matches,
-        severity: suspicious ? severity : null,
-        suspicious: !!suspicious,
-      };
-
-      complianceEvents.push(ev);
-      const ok = saveJsonSafe(COMPLIANCE_EVENTS_PATH, complianceEvents);
-      if (!ok) return;
-
-      if (suspicious) {
-        const prev = complianceByDevice.get(deviceId) || { count: 0, lastAt: 0, lastSeverity: null };
-        prev.count += 1;
-        prev.lastAt = ev.timestamp;
-        prev.lastSeverity = ev.severity;
-        complianceByDevice.set(deviceId, prev);
-
-        broadcastToAdmins({
-          type: "compliance_event",
-          deviceId,
-          count: prev.count,
-          severity: ev.severity,
-          ts: ev.timestamp,
-        });
-      }
-
-      return;
-    }
-  });
-
-  ws.on("close", (code) => {
-    const current = wsAgentsByDeviceId.get(deviceId);
-    if (current === ws) {
-      wsAgentsByDeviceId.delete(deviceId);
-    }
-
-    const dev = findDevice(deviceId);
-    if (dev) dev.connected = false;
-
-    console.log(`🔌 Dispositivo ${deviceId} desconectado (code=${code})`);
-    if (dev) emitPresence(deviceId, false, dev);
-  });
-
-  ws.on("error", (err) => {
-    console.log(`⚠️ WS agent error (${deviceId}):`, err.message);
-  });
-}
-
-function handleAdmin(ws, token) {
-  let decoded;
-  try {
-    decoded = verifyAdminToken(token);
-  } catch {
-    return ws.close(1008, "invalid admin token");
-  }
-
-  ws.isAdmin = true;
-  ws.adminId = decoded.id;
-  ws.adminUser = decoded.username;
-
-  console.log(`✅ Admin ${decoded.username} conectado`);
-  sendDevicesSnapshot(ws);
-
-  ws.on("message", (msg) => {
-    let data;
-    try {
-      data = JSON.parse(msg.toString());
-    } catch {
-      return;
-    }
-
-    if (data.type === "request_remote_access") {
-      const targetDeviceId = normDeviceId(data.deviceId);
-      const deviceWs = wsAgentsByDeviceId.get(targetDeviceId);
-
-      if (deviceWs && deviceWs.readyState === WebSocket.OPEN) {
-        logs.push({
-          adminId: decoded.id,
-          deviceId: targetDeviceId,
-          action: "request_remote_access",
-          timestamp: new Date(),
-        });
-
-        safeSend(deviceWs, {
-          type: "consent_request",
-          admin: decoded.username,
-        });
-      } else {
-        safeSend(ws, { type: "error", message: "Dispositivo offline" });
-      }
-      return;
-    }
-
-    if (data.type === "get_last_frame" && data.deviceId) {
-      const id = normDeviceId(data.deviceId);
-      const jpeg = lastFrameByDevice[id];
-      if (jpeg) {
-        safeSend(ws, { type: "screen_frame", deviceId: id, jpeg, ts: nowMs() });
-      }
-      return;
-    }
-  });
-
-  ws.on("close", (code) => {
-    console.log(`🔌 Admin ${decoded.username} desconectado (code=${code})`);
-  });
-
-  ws.on("error", (err) => {
-    console.log(`⚠️ WS admin error (${decoded.username}):`, err.message);
-  });
-}
-
-wss.on("connection", (ws, req) => {
-  const params = parseQuery(req.url);
-
-  const role = params.get("role");
-  const deviceIdRaw = params.get("deviceId");
-  const token = params.get("token");
-  const adminToken = params.get("adminToken");
-  const effectiveAdminToken = adminToken || token;
-
-  const deviceId = normDeviceId(deviceIdRaw);
-
-  console.log("[WS] connection:", {
-    role,
-    deviceId: deviceId || null,
-    hasToken: !!token,
-    hasAdminToken: !!adminToken,
-  });
-
-  if (role === "agent") {
-    if (!deviceId) return ws.close(1008, "deviceId required");
-    return handleAgent(ws, deviceId, params);
-  }
-
-  if (role === "admin") {
-    if (!effectiveAdminToken) return ws.close(1008, "admin token required");
-    return handleAdmin(ws, effectiveAdminToken);
-  }
-
-  if (deviceId) {
-    console.log(`ℹ️ Conexão compat detectada. Tratando como agent: ${deviceId}`);
-    return handleAgent(ws, deviceId, params);
-  }
-
-  if (effectiveAdminToken) {
-    console.log(`ℹ️ Conexão compat detectada. Tratando como admin.`);
-    return handleAdmin(ws, effectiveAdminToken);
-  }
-
-  ws.close(1008, "missing role");
-});
-
-// ============================
-// Presence TTL job (anti-zumbi)
+// Presence TTL cleanup
 // ============================
 setInterval(() => {
-  const now = nowMs();
-
+  const t = nowMs();
   for (const d of devices) {
     if (!d.connected) continue;
+    const last = Number(d.lastSeen || 0);
+    if (last && t - last > PRESENCE_TTL_MS) {
+      d.connected = false;
 
-    const last = d.lastSeen || 0;
-    if (now - last <= PRESENCE_TTL_MS) continue;
+      addLog("WARN", "Presence TTL: marcando device offline", { deviceId: d.id });
 
-    const ws = wsAgentsByDeviceId.get(d.id);
-    try {
-      if (ws && ws.readyState !== WebSocket.CLOSED) ws.terminate();
-    } catch { }
-
-    wsAgentsByDeviceId.delete(d.id);
-    d.connected = false;
-
-    console.log(`⏱️ PRESENCE TTL: marcando offline ${d.id}`);
-    emitPresence(d.id, false, d);
+      broadcastToAdmins({
+        type: "device_presence",
+        deviceId: d.id,
+        online: false,
+        lastSeen: t,
+      });
+    }
   }
-}, 5000);
+}, 3000).unref?.();
+
+// ============================
+// WebSocket
+// ============================
+wss.on("connection", (ws, req) => {
+  const url = String(req.url || "");
+  const params = new URLSearchParams(url.replace("/?", ""));
+  const role = params.get("role");
+  const deviceId = normDeviceId(params.get("deviceId"));
+  const token = params.get("token");
+  const agentVersion = String(params.get("v") || "").trim() || null;
+
+  addLog("INFO", "WS connection", {
+    ip: req.socket?.remoteAddress,
+    url,
+    role,
+    deviceId: deviceId || null,
+    v: agentVersion,
+  });
+
+  if (role === "admin") {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      ws.isAdmin = true;
+      ws.adminUser = decoded.username;
+
+      addLog("INFO", "Admin conectado", { username: decoded.username });
+
+      safeSend(ws, { type: "devices_snapshot", devices: devices.map((d) => ({ ...d })) });
+    } catch {
+      addLog("ERROR", "Admin WS token inválido", { ip: req.socket?.remoteAddress });
+      return ws.close(1008, "invalid admin token");
+    }
+  }
+
+  if (role === "agent" && deviceId) {
+    const d = upsertDevice(deviceId);
+    d.connected = true;
+    d.lastSeen = nowMs();
+    if (agentVersion) d.agentVersion = agentVersion;
+
+    ws.isAgent = true;
+    ws.deviceId = deviceId;
+
+    wsAgentsByDeviceId.set(deviceId, ws);
+
+    addLog("INFO", "Agent conectado", { deviceId, agentVersion: d.agentVersion });
+
+    broadcastToAdmins({
+      type: "device_presence",
+      deviceId,
+      online: true,
+      lastSeen: d.lastSeen,
+      agentVersion: d.agentVersion,
+    });
+  }
+
+  ws.on("message", (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      addLog("WARN", "WS mensagem não-JSON", { size: String(raw || "").length });
+      return;
+    }
+
+    addLog("INFO", "WS message", {
+      isAdmin: !!ws.isAdmin,
+      isAgent: !!ws.isAgent,
+      deviceId: ws.deviceId || null,
+      type: msg?.type || null,
+    });
+
+    // ping/pong (qualquer role)
+    if (msg?.type === "ping") {
+      if (ws.isAgent && ws.deviceId) {
+        const d = upsertDevice(ws.deviceId);
+        d.lastSeen = nowMs();
+      }
+      safeSend(ws, { type: "pong" });
+      return;
+    }
+
+    // ----------------------------
+    // ADMIN -> pedir suporte
+    // ----------------------------
+    if (ws.isAdmin && msg?.type === "request_remote_access") {
+      const targetId = normDeviceId(msg.deviceId);
+      const agentWs = wsAgentsByDeviceId.get(targetId);
+
+      addLog("INFO", "request_remote_access", {
+        admin: ws.adminUser,
+        deviceId: targetId,
+        agentOnline: !!agentWs && agentWs.readyState === WebSocket.OPEN,
+      });
+
+      if (!agentWs || agentWs.readyState !== WebSocket.OPEN) {
+        safeSend(ws, {
+          type: "consent_response",
+          deviceId: targetId,
+          accepted: false,
+          reason: "agent_offline",
+        });
+        return;
+      }
+
+      safeSend(agentWs, { type: "consent_request", admin: ws.adminUser });
+      safeSend(ws, { type: "consent_status", deviceId: targetId, status: "sent_to_agent" });
+      return;
+    }
+
+    // ----------------------------
+    // AGENT -> resposta do consentimento
+    // ----------------------------
+    if (ws.isAgent && msg?.type === "consent_response") {
+      const id = ws.deviceId;
+      const accepted = !!msg.accepted;
+
+      addLog("INFO", "consent_response", { deviceId: id, accepted });
+
+      broadcastToAdmins({ type: "consent_response", deviceId: id, accepted });
+      return;
+    }
+
+    // ----------------------------
+    // AGENT -> frame (aceita 2 formatos)
+    // 1) { type:"frame", jpegBase64:"..." }
+    // 2) { type:"screen_frame", jpeg:"..." }
+    // ----------------------------
+    if (ws.isAgent && (msg?.type === "frame" || msg?.type === "screen_frame")) {
+      const id = ws.deviceId;
+
+      const payload =
+        typeof msg.jpegBase64 === "string"
+          ? msg.jpegBase64
+          : typeof msg.jpeg === "string"
+            ? msg.jpeg
+            : "";
+
+      if (!payload) return;
+
+      // presença
+      const d = upsertDevice(id);
+      d.lastSeen = nowMs();
+
+      // throttle
+      const lastAt = Number(lastFrameSentAtByDevice[id] || 0);
+      const t = nowMs();
+      if (t - lastAt < MIN_FRAME_INTERVAL_MS) return;
+      lastFrameSentAtByDevice[id] = t;
+
+      // guarda exatamente como veio (dataURL ou base64)
+      lastFrameByDevice[id] = payload;
+
+      addLog("INFO", "frame_received", {
+        deviceId: id,
+        len: payload.length,
+        isDataUrl: payload.startsWith("data:"),
+      });
+
+      // debug útil
+      if (payload.length > 50) {
+        console.log(
+          "📸 FRAME RECEBIDO DE",
+          id,
+          "len:",
+          payload.length,
+          "dataURL:",
+          payload.startsWith("data:")
+        );
+      }
+
+      return;
+    }
+  });
+
+  ws.on("close", (code, reason) => {
+    addLog("INFO", "WS close", {
+      code,
+      reason: reason ? reason.toString() : "",
+      isAgent: !!ws.isAgent,
+      isAdmin: !!ws.isAdmin,
+      deviceId: ws.deviceId || null,
+    });
+
+    if (ws.isAgent && ws.deviceId) {
+      const d = findDevice(ws.deviceId);
+      if (d) d.connected = false;
+
+      wsAgentsByDeviceId.delete(ws.deviceId);
+
+      broadcastToAdmins({
+        type: "device_presence",
+        deviceId: ws.deviceId,
+        online: false,
+        lastSeen: nowMs(),
+      });
+    }
+  });
+
+  ws.on("error", (e) => {
+    addLog("ERROR", "WS error", {
+      isAgent: !!ws.isAgent,
+      isAdmin: !!ws.isAdmin,
+      deviceId: ws.deviceId || null,
+      err: String(e?.message || e),
+    });
+  });
+});
 
 // ============================
 // Start
 // ============================
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Backend rodando na porta ${PORT}`);
-  console.log(`UI: http://localhost:${PORT}`);
+  addLog("INFO", "Backend rodando", { port: PORT });
 });

@@ -18,16 +18,31 @@ const FALLBACK_PORT = "3001";
 
 function getBackendBaseFromWindow() {
   try {
-    const { protocol, hostname, port } = window.location;
+    const { protocol, hostname, port, origin } = window.location;
 
     const isHttps = protocol === "https:";
-    const httpProto = isHttps ? "https" : "http";
     const wsProto = isHttps ? "wss" : "ws";
 
+    const isLocal =
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname.startsWith("192.168.") ||
+      hostname.startsWith("10.") ||
+      hostname.startsWith("172.");
+
+    // 🌐 PRODUÇÃO (Cloudflare / HTTPS público)
+    if (isHttps && !isLocal) {
+      return {
+        HTTP_BASE: origin,
+        WS_BASE: `${wsProto}://${hostname}`,
+      };
+    }
+
+    // 🖥️ LOCAL / LAN
     const p = port && String(port).trim() ? String(port).trim() : FALLBACK_PORT;
 
     return {
-      HTTP_BASE: `${httpProto}://${hostname}:${p}`,
+      HTTP_BASE: `${protocol}//${hostname}:${p}`,
       WS_BASE: `${wsProto}://${hostname}:${p}`,
     };
   } catch {
@@ -37,6 +52,7 @@ function getBackendBaseFromWindow() {
     };
   }
 }
+
 
 const { HTTP_BASE, WS_BASE } = getBackendBaseFromWindow();
 
@@ -190,7 +206,9 @@ function ScreenViewer({ deviceId, displayName, onClose }) {
 
   if (!deviceId) return null;
 
-  const frameUrl = `${HTTP_BASE}/api/devices/${deviceId}/frame?ts=${tick}`;
+const frameUrl =
+  `${HTTP_BASE}/api/devices/${encodeURIComponent(deviceId)}/mjpeg` +
+  `?token=${encodeURIComponent(localStorage.getItem("lookout_token") || "")}`;
 
   return (
     <div className="panel" style={{ marginTop: 18 }}>
@@ -312,8 +330,14 @@ function LoginForm({ onLogin }) {
  * ============================================
  */
 function App() {
-  const [token, setToken] = useState(null);
-  const [user, setUser] = useState(null);
+  const [token, setToken] = useState(() => localStorage.getItem("lookout_token") || "");
+  const [user, setUser] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem("lookout_user") || "null");
+    } catch {
+      return null;
+    }
+  });
 
   const [devicesById, setDevicesById] = useState({});
   const [logs, setLogs] = useState([]);
@@ -394,10 +418,14 @@ function App() {
       alert("Login falhou");
       return;
     }
-
     const data = await res.json();
-    setToken(data.token);
-    setUser(data.user);
+
+    localStorage.setItem("lookout_token", data.token || "");
+    localStorage.setItem("lookout_user", JSON.stringify(data.user || null));
+
+    setToken(data.token || "");
+    setUser(data.user || null);
+
   };
 
   const logout = () => {
@@ -418,8 +446,11 @@ function App() {
     setActiveTab("devices");
     setSearchTerm("");
 
-    setToken(null);
+    localStorage.removeItem("lookout_token");
+    localStorage.removeItem("lookout_user");
+    setToken("");
     setUser(null);
+
   };
 
   /**
@@ -428,27 +459,52 @@ function App() {
    * ============================================
    */
   const fetchDevices = async (authToken) => {
+    if (!authToken) return;
+
     const headers = { Authorization: `Bearer ${authToken}` };
     const res = await fetch(`${HTTP_BASE}/api/devices`, { headers });
+
+    if (res.status === 401) {
+      logout();
+      return;
+    }
     if (!res.ok) return;
 
     const list = await res.json();
     setDevicesById(arrayToMapById(list));
   };
 
+
+
   const fetchLogs = async (authToken) => {
+    if (!authToken) return;
+
     const headers = { Authorization: `Bearer ${authToken}` };
     const res = await fetch(`${HTTP_BASE}/api/logs`, { headers });
+
+    if (res.status === 401) {
+      logout();
+      return;
+    }
     if (!res.ok) return;
+
     setLogs(await res.json());
   };
 
   const fetchAliases = async (authToken) => {
+    if (!authToken) return;
+
     const headers = { Authorization: `Bearer ${authToken}` };
     const res = await fetch(`${HTTP_BASE}/api/device-aliases`, { headers });
+
+    if (res.status === 401) {
+      logout();
+      return;
+    }
     if (!res.ok) return;
 
     const data = await res.json();
+
     const normalized = {};
     for (const [k, v] of Object.entries(data || {})) {
       const id = normId(k);
@@ -463,8 +519,10 @@ function App() {
         };
       }
     }
+
     setAliasesById(normalized);
   };
+
 
   const fetchComplianceEvents = async (authToken, deviceIdFilter) => {
     const headers = { Authorization: `Bearer ${authToken}` };
@@ -478,6 +536,13 @@ function App() {
     if (!authToken) return;
     await Promise.all([fetchDevices(authToken), fetchLogs(authToken), fetchAliases(authToken)]);
   };
+
+  useEffect(() => {
+    if (!token) return;
+    fetchData(token);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token]);
+
 
   /**
    * ============================================

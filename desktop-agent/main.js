@@ -149,12 +149,12 @@ function tryAcquireGlobalLock() {
       // Se não existe, lock órfão: remove e tenta adquirir
       try {
         fs.unlinkSync(LOCK_PATH);
-      } catch {}
+      } catch { }
     } catch {
       // Lock corrompido: tenta remover
       try {
         fs.unlinkSync(LOCK_PATH);
-      } catch {}
+      } catch { }
     }
   }
 
@@ -197,7 +197,7 @@ function releaseGlobalLock() {
     if (Number(info?.pid) === process.pid) {
       fs.unlinkSync(LOCK_PATH);
     }
-  } catch {}
+  } catch { }
 }
 
 // ============================
@@ -210,7 +210,7 @@ function getOrCreateDeviceId() {
       const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
       if (cfg.deviceId) return cfg.deviceId;
     }
-  } catch {}
+  } catch { }
 
   const deviceId = "device-" + crypto.randomUUID();
   const cfg = {
@@ -223,7 +223,7 @@ function getOrCreateDeviceId() {
 
   try {
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
-  } catch {}
+  } catch { }
 
   return deviceId;
 }
@@ -272,7 +272,7 @@ function setStatus(text) {
       `document.getElementById('st').innerText = \`${safe}\`;`,
       true
     );
-  } catch {}
+  } catch { }
 }
 
 // ============================
@@ -314,7 +314,7 @@ function connectWs() {
     try {
       ws.removeAllListeners();
       ws.close();
-    } catch {}
+    } catch { }
   }
 
   setStatus("Conectando...");
@@ -370,7 +370,7 @@ function connectWs() {
     // Evita crash por erro de rede
     try {
       ws.close();
-    } catch {}
+    } catch { }
   });
 }
 
@@ -385,17 +385,15 @@ async function sendFrame() {
 
   const sources = await desktopCapturer.getSources({
     types: ["screen"],
-    thumbnailSize: { width: 1280, height: 720 }
+    thumbnailSize: { width: 960, height: 540 }
   });
 
   if (!sources.length) return;
 
   ws.send(
     JSON.stringify({
-      type: "screen_frame",
-      deviceId: DEVICE_ID,
-      jpeg: sources[0].thumbnail.toDataURL("image/jpeg", 0.6),
-      ts: Date.now()
+      type: "frame",
+      jpegBase64: sources[0].thumbnail.toDataURL("image/jpeg", 0.45)
     })
   );
 }
@@ -407,15 +405,11 @@ function startStreaming() {
   const loop = async () => {
     if (!streaming) return;
     await sendFrame();
-    setTimeout(loop, 150);
+    setTimeout(loop, 250); // ~4 FPS (internet-friendly)
   };
+
   loop();
 }
-
-function stopStreaming() {
-  streaming = false;
-}
-
 // ============================
 // APP
 // ============================
@@ -425,7 +419,7 @@ const gotSingleInstance = app.requestSingleInstanceLock();
 if (!gotSingleInstance) {
   try {
     app.quit();
-  } catch {}
+  } catch { }
 }
 
 app.whenReady().then(async () => {
@@ -434,7 +428,7 @@ app.whenReady().then(async () => {
   if (!lock.ok) {
     try {
       app.quit();
-    } catch {}
+    } catch { }
     return;
   }
 
@@ -447,7 +441,7 @@ app.on("before-quit", () => {
   try {
     stopHeartbeat();
     stopStreaming();
-  } catch {}
+  } catch { }
   releaseGlobalLock();
 });
 

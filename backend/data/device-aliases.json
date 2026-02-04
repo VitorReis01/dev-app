@@ -2,5 +2,13 @@
   "device-TSCGA": {
     "label": "Lucineia",
     "updatedAt": 1769697409995
+  },
+  "device-f0a8136a-391b-4472-8223-f32c6e426d36": {
+    "label": "Viviane",
+    "updatedAt": 1770127926245
+  },
+  "device-607ce37d-4d9a-45bb-8a51-9b0d420a6572": {
+    "label": "João",
+    "updatedAt": 1770128830673
   }
 }
