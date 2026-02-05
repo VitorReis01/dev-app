@@ -35,8 +35,11 @@ function addLog(level, msg, meta) {
 
   // também vai pro console (ajuda no NSSM/serviço)
   try {
-    console.log(`[${new Date(entry.ts).toISOString()}] ${entry.level}: ${entry.msg}`, entry.meta ?? "");
-  } catch { }
+    console.log(
+      `[${new Date(entry.ts).toISOString()}] ${entry.level}: ${entry.msg}`,
+      entry.meta ?? ""
+    );
+  } catch {}
 }
 
 // ============================
@@ -57,7 +60,9 @@ app.use((req, _res, next) => {
   next();
 });
 
-const JWT_SECRET = "supersecretkey";
+// ✅ Mantém compatível com seu setup atual,
+// mas permite trocar sem refatorar depois (via variável de ambiente).
+const JWT_SECRET = process.env.JWT_SECRET || "supersecretkey";
 const PORT = Number(process.env.PORT || 3001);
 
 // ============================
@@ -73,7 +78,7 @@ const ALIASES_PATH = path.join(DATA_DIR, "device-aliases.json");
 function ensureDataDir() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-  } catch { }
+  } catch {}
 }
 
 function loadJsonSafe(filePath, fallback) {
@@ -166,14 +171,19 @@ const adminsSeed = [
 const devices = []; // { id, connected, lastSeen, agentVersion }
 const wsAgentsByDeviceId = new Map();
 
-// guarda o último frame por deviceId (pode ser dataURL ou base64 puro)
+// ✅ Agora pode guardar:
+// - string base64 / dataURL (modo antigo)
+// - OU Buffer (modo novo binário)
 const lastFrameByDevice = Object.create(null);
 
 // throttle p/ frames
 const lastFrameSentAtByDevice = Object.create(null);
-const MIN_FRAME_INTERVAL_MS =250; // 4fps máximo
+const MIN_FRAME_INTERVAL_MS = 250; // 4fps máximo
 
 const PRESENCE_TTL_MS = 15000;
+
+// ✅ viewers MJPEG por device (para gating do stream)
+const mjpegViewersByDevice = Object.create(null);
 
 // ============================
 // Helpers
@@ -224,6 +234,46 @@ function stripDataUrlToBase64(maybeDataUrl) {
   return { mime: "image/jpeg", base64: s, isDataUrl: false, raw: s };
 }
 
+function isBufferLike(v) {
+  return Buffer.isBuffer(v);
+}
+
+function getAgentWs(deviceId) {
+  const id = normDeviceId(deviceId);
+  const ws = wsAgentsByDeviceId.get(id);
+  if (ws && ws.readyState === WebSocket.OPEN) return ws;
+  return null;
+}
+
+function incMjpegViewer(deviceId) {
+  const id = normDeviceId(deviceId);
+  const n = Number(mjpegViewersByDevice[id] || 0) + 1;
+  mjpegViewersByDevice[id] = n;
+  return n;
+}
+
+function decMjpegViewer(deviceId) {
+  const id = normDeviceId(deviceId);
+  const n = Math.max(0, Number(mjpegViewersByDevice[id] || 0) - 1);
+  mjpegViewersByDevice[id] = n;
+  return n;
+}
+
+// ✅ compat: envia os 2 nomes (hífen e underscore)
+function sendStreamEnable(agentWs, deviceId) {
+  if (!agentWs) return;
+  safeSend(agentWs, { type: "stream-enable" });
+  safeSend(agentWs, { type: "stream_enable" });
+  addLog("INFO", "stream enable enviado (compat)", { deviceId });
+}
+
+function sendStreamDisable(agentWs, deviceId) {
+  if (!agentWs) return;
+  safeSend(agentWs, { type: "stream-disable" });
+  safeSend(agentWs, { type: "stream_disable" });
+  addLog("INFO", "stream disable enviado (compat)", { deviceId });
+}
+
 // ============================
 // ✅ ADMIN CONSOLE (React build) (ANTES do fallback)
 // ============================
@@ -236,6 +286,13 @@ if (fs.existsSync(ADMIN_BUILD_DIR)) {
 } else {
   addLog("ERROR", "Admin Console build NÃO encontrado", { dir: ADMIN_BUILD_DIR });
 }
+
+// ============================
+// ✅ Health check (sem auth)
+// ============================
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, ts: Date.now() });
+});
 
 // ============================
 // Auth
@@ -254,7 +311,6 @@ app.post("/api/login", (req, res) => {
   });
 
   addLog("INFO", "Login OK", { username: admin.username });
-
   res.json({ token, user: { id: admin.id, username: admin.username } });
 });
 
@@ -295,8 +351,6 @@ function authenticateAdminFlex(req, res, next) {
 // ============================
 // REST
 // ============================
-
-// lista devices (já com compliance e status)
 app.get("/api/devices", authenticateAdmin, (_req, res) => {
   const out = devices.map((d) => {
     const comp = getComplianceState(d.id);
@@ -315,7 +369,6 @@ app.get("/api/devices", authenticateAdmin, (_req, res) => {
   res.json(out);
 });
 
-// logs (agora sempre útil)
 app.get("/api/logs", authenticateAdmin, (_req, res) => {
   res.setHeader("Cache-Control", "no-store");
   res.json(logs);
@@ -327,6 +380,14 @@ app.get("/api/devices/:deviceId/frame", authenticateAdminFlex, (req, res) => {
   const frameRaw = lastFrameByDevice[deviceId];
 
   if (!frameRaw) return res.status(404).send("No frame");
+
+  if (isBufferLike(frameRaw)) {
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    return res.end(frameRaw);
+  }
 
   const info = stripDataUrlToBase64(frameRaw);
 
@@ -342,48 +403,85 @@ app.get("/api/devices/:deviceId/frame", authenticateAdminFlex, (req, res) => {
   }
 });
 
-// ✅ MJPEG (stream estilo vídeo)
+// ✅ MJPEG (stream estilo vídeo) + gating (enable/disable no agent)
 app.get("/api/devices/:deviceId/mjpeg", authenticateAdminFlex, (req, res) => {
   const deviceId = normDeviceId(req.params.deviceId);
+
+  // LOG ÚTIL (pra provar que o request chegou no Node)
+  addLog("INFO", "MJPEG endpoint hit", {
+    deviceId,
+    hasToken: !!String(req.query?.token || ""),
+    user: req.admin?.username || null,
+  });
+
+  const viewers = incMjpegViewer(deviceId);
+
+  if (viewers === 1) {
+    const agentWs = getAgentWs(deviceId);
+    if (agentWs) {
+      // ✅ compat total: manda os dois
+      sendStreamEnable(agentWs, deviceId);
+    } else {
+      addLog("WARN", "MJPEG viewer abriu mas agent offline", { deviceId });
+    }
+  }
 
   res.writeHead(200, {
     "Content-Type": "multipart/x-mixed-replace; boundary=frame",
     "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
     Pragma: "no-cache",
     Expires: "0",
-    Connection: "close",
+    Connection: "keep-alive",
   });
 
   let alive = true;
-  req.on("close", () => {
-    alive = false;
-    clearInterval(timer);
-    try {
-      res.end();
-    } catch { }
-  });
 
+  const intervalMs = 250; // 4fps
   const timer = setInterval(() => {
     if (!alive) return;
 
     const frameRaw = lastFrameByDevice[deviceId];
     if (!frameRaw) return;
 
-    const info = stripDataUrlToBase64(frameRaw);
-
     let buf;
-    try {
-      buf = Buffer.from(info.base64, "base64");
-    } catch {
-      return;
+    let mime = "image/jpeg";
+
+    if (isBufferLike(frameRaw)) {
+      buf = frameRaw;
+    } else {
+      const info = stripDataUrlToBase64(frameRaw);
+      mime = info.mime || "image/jpeg";
+      try {
+        buf = Buffer.from(info.base64, "base64");
+      } catch {
+        return;
+      }
     }
 
     res.write(`--frame\r\n`);
-    res.write(`Content-Type: ${info.mime || "image/jpeg"}\r\n`);
+    res.write(`Content-Type: ${mime}\r\n`);
     res.write(`Content-Length: ${buf.length}\r\n\r\n`);
     res.write(buf);
     res.write(`\r\n`);
-  }, 120); // ~8fps
+  }, intervalMs);
+
+  req.on("close", () => {
+    alive = false;
+    clearInterval(timer);
+    try {
+      res.end();
+    } catch {}
+
+    const left = decMjpegViewer(deviceId);
+
+    if (left === 0) {
+      const agentWs = getAgentWs(deviceId);
+      if (agentWs) {
+        // ✅ compat total: manda os dois
+        sendStreamDisable(agentWs, deviceId);
+      }
+    }
+  });
 });
 
 // aliases
@@ -403,7 +501,7 @@ app.put("/api/device-aliases/:deviceId", authenticateAdmin, (req, res) => {
   res.json({ ok: true, deviceId: id, ...deviceAliases[id] });
 });
 
-// ✅ compliance events (pra UI)
+// compliance events
 app.get("/api/compliance/events", authenticateAdmin, (req, res) => {
   const filterId = String(req.query?.deviceId || "").trim();
   const out = filterId
@@ -413,9 +511,7 @@ app.get("/api/compliance/events", authenticateAdmin, (req, res) => {
   res.json([...out].sort((a, b) => Number(b?.timestamp || 0) - Number(a?.timestamp || 0)));
 });
 
-// ============================
-// ✅ API 404 JSON (depois de TODAS as rotas /api)
-// ============================
+// ✅ API 404 JSON
 app.use("/api", (req, res) => {
   res.status(404).json({
     error: "API route not found",
@@ -424,9 +520,7 @@ app.use("/api", (req, res) => {
   });
 });
 
-// ============================
-// ✅ SPA fallback (NO FINAL)
-// ============================
+// ✅ SPA fallback
 app.get(/^\/(?!api\/).*/, (_req, res) => {
   if (!fs.existsSync(ADMIN_INDEX_HTML)) {
     return res.status(404).send("Admin Console build not found");
@@ -462,7 +556,11 @@ setInterval(() => {
 // ============================
 wss.on("connection", (ws, req) => {
   const url = String(req.url || "");
-  const params = new URLSearchParams(url.replace("/?", ""));
+
+  // ✅ CORREÇÃO: parse robusto do querystring
+  const qs = url.includes("?") ? url.split("?")[1] : "";
+  const params = new URLSearchParams(qs);
+
   const role = params.get("role");
   const deviceId = normDeviceId(params.get("deviceId"));
   const token = params.get("token");
@@ -475,6 +573,12 @@ wss.on("connection", (ws, req) => {
     deviceId: deviceId || null,
     v: agentVersion,
   });
+
+  // ✅ CORREÇÃO: fecha conexão se role inválido
+  if (role !== "admin" && role !== "agent") {
+    addLog("WARN", "WS role inválido - fechando", { role, ip: req.socket?.remoteAddress });
+    return ws.close(1008, "invalid role");
+  }
 
   if (role === "admin") {
     try {
@@ -489,6 +593,12 @@ wss.on("connection", (ws, req) => {
       addLog("ERROR", "Admin WS token inválido", { ip: req.socket?.remoteAddress });
       return ws.close(1008, "invalid admin token");
     }
+  }
+
+  // ✅ CORREÇÃO: agent sem deviceId -> fecha
+  if (role === "agent" && !deviceId) {
+    addLog("WARN", "Agent conectou sem deviceId - fechando", { ip: req.socket?.remoteAddress });
+    return ws.close(1008, "missing deviceId");
   }
 
   if (role === "agent" && deviceId) {
@@ -513,7 +623,28 @@ wss.on("connection", (ws, req) => {
     });
   }
 
-  ws.on("message", (raw) => {
+  ws.on("message", (raw, isBinary) => {
+    if (ws.isAgent && isBinary) {
+      const id = ws.deviceId;
+
+      const d = upsertDevice(id);
+      d.lastSeen = nowMs();
+
+      const lastAt = Number(lastFrameSentAtByDevice[id] || 0);
+      const t = nowMs();
+      if (t - lastAt < MIN_FRAME_INTERVAL_MS) return;
+      lastFrameSentAtByDevice[id] = t;
+
+      lastFrameByDevice[id] = Buffer.from(raw);
+
+      addLog("INFO", "frame_received_binary", {
+        deviceId: id,
+        bytes: raw?.length || 0,
+      });
+
+      return;
+    }
+
     let msg;
     try {
       msg = JSON.parse(raw.toString());
@@ -529,7 +660,6 @@ wss.on("connection", (ws, req) => {
       type: msg?.type || null,
     });
 
-    // ping/pong (qualquer role)
     if (msg?.type === "ping") {
       if (ws.isAgent && ws.deviceId) {
         const d = upsertDevice(ws.deviceId);
@@ -539,9 +669,6 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    // ----------------------------
-    // ADMIN -> pedir suporte
-    // ----------------------------
     if (ws.isAdmin && msg?.type === "request_remote_access") {
       const targetId = normDeviceId(msg.deviceId);
       const agentWs = wsAgentsByDeviceId.get(targetId);
@@ -567,9 +694,6 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    // ----------------------------
-    // AGENT -> resposta do consentimento
-    // ----------------------------
     if (ws.isAgent && msg?.type === "consent_response") {
       const id = ws.deviceId;
       const accepted = !!msg.accepted;
@@ -580,11 +704,6 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    // ----------------------------
-    // AGENT -> frame (aceita 2 formatos)
-    // 1) { type:"frame", jpegBase64:"..." }
-    // 2) { type:"screen_frame", jpeg:"..." }
-    // ----------------------------
     if (ws.isAgent && (msg?.type === "frame" || msg?.type === "screen_frame")) {
       const id = ws.deviceId;
 
@@ -592,41 +711,26 @@ wss.on("connection", (ws, req) => {
         typeof msg.jpegBase64 === "string"
           ? msg.jpegBase64
           : typeof msg.jpeg === "string"
-            ? msg.jpeg
-            : "";
+          ? msg.jpeg
+          : "";
 
       if (!payload) return;
 
-      // presença
       const d = upsertDevice(id);
       d.lastSeen = nowMs();
 
-      // throttle
       const lastAt = Number(lastFrameSentAtByDevice[id] || 0);
       const t = nowMs();
       if (t - lastAt < MIN_FRAME_INTERVAL_MS) return;
       lastFrameSentAtByDevice[id] = t;
 
-      // guarda exatamente como veio (dataURL ou base64)
       lastFrameByDevice[id] = payload;
 
-      addLog("INFO", "frame_received", {
+      addLog("INFO", "frame_received_json", {
         deviceId: id,
         len: payload.length,
         isDataUrl: payload.startsWith("data:"),
       });
-
-      // debug útil
-      if (payload.length > 50) {
-        console.log(
-          "📸 FRAME RECEBIDO DE",
-          id,
-          "len:",
-          payload.length,
-          "dataURL:",
-          payload.startsWith("data:")
-        );
-      }
 
       return;
     }
@@ -646,6 +750,7 @@ wss.on("connection", (ws, req) => {
       if (d) d.connected = false;
 
       wsAgentsByDeviceId.delete(ws.deviceId);
+      mjpegViewersByDevice[ws.deviceId] = 0;
 
       broadcastToAdmins({
         type: "device_presence",

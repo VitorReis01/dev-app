@@ -9,14 +9,19 @@
  * ✔ WebSocket com heartbeat
  * ✔ Reconexão automática
  * ✔ Anti-múltiplas sessões (LOCK GLOBAL)
- * ✔ Pronto para escala LAN
  *
- * ✅ FIX CROSS-PLATFORM:
- * - Antes: storage/lock hardcoded em C:\ProgramData\... (Windows-only)
- * - paths por SO + fallback seguro quando global não tiver permissão
+ * ✅ STREAM OTIMIZADO (internet/5G):
+ * - Envia JPEG BINÁRIO (Buffer) via WebSocket (sem base64)
+ * - Só faz stream quando backend manda "stream-enable"
+ * - Para quando backend manda "stream-disable"
+ *
+ * ✅ CONSENTIMENTO (sessão):
+ * - Pede 1x
+ * - Enquanto a sessão estiver ativa, não pede novamente
+ * - Quando o viewer fecha (stream-disable) ou o app reinicia, volta a pedir
  */
 
-const { app, BrowserWindow, dialog, desktopCapturer } = require("electron");
+const { app, BrowserWindow, dialog, desktopCapturer, ipcMain } = require("electron");
 const WebSocket = require("ws");
 const path = require("path");
 const fs = require("fs");
@@ -25,7 +30,6 @@ const crypto = require("crypto");
 // ============================
 // CONFIG FIXA
 // ============================
-
 const BACKEND_HOST = "192.168.1.101";
 const BACKEND_PORT = 3001;
 const AGENT_VERSION = "1.0.5";
@@ -33,18 +37,6 @@ const AGENT_VERSION = "1.0.5";
 // ============================
 // STORAGE GLOBAL (POR MÁQUINA) - CROSS PLATFORM
 // ============================
-
-/**
- * ✅ Regras:
- * - Windows: C:\ProgramData\LOOKOUT\ (global por máquina)
- * - Linux: tenta /var/lib/lookout/ (global por máquina)
- *   - se sem permissão: fallback para ~/.lookout/ (por usuário, mas não quebra execução)
- * - macOS: tenta /Library/Application Support/LOOKOUT (global por máquina)
- *   - se sem permissão: fallback para ~/Library/Application Support/LOOKOUT (por usuário)
- *
- * Obs: Se quiser forçar path (deploy corporativo),
- * pode setar env LOOKOUT_BASE_DIR=/caminho/custom
- */
 function ensureDir(dir) {
   try {
     fs.mkdirSync(dir, { recursive: true });
@@ -66,7 +58,6 @@ function canWrite(dir) {
 }
 
 function resolveBaseDir() {
-  // ✅ override manual (deploy corporativo)
   const forced = String(process.env.LOOKOUT_BASE_DIR || "").trim();
   if (forced) {
     if (ensureDir(forced)) return forced;
@@ -74,7 +65,6 @@ function resolveBaseDir() {
 
   const platform = process.platform;
 
-  // Windows (global por máquina)
   if (platform === "win32") {
     const PROGRAM_DATA = process.env.ProgramData || "C:\\ProgramData";
     const dir = path.join(PROGRAM_DATA, "LOOKOUT");
@@ -82,7 +72,6 @@ function resolveBaseDir() {
     return dir;
   }
 
-  // Linux (tenta global, fallback user)
   if (platform === "linux") {
     const dir1 = "/var/lib/lookout";
     if (ensureDir(dir1) && canWrite(dir1)) return dir1;
@@ -96,7 +85,6 @@ function resolveBaseDir() {
     return dir3;
   }
 
-  // macOS (tenta global, fallback user)
   if (platform === "darwin") {
     const dir1 = "/Library/Application Support/LOOKOUT";
     if (ensureDir(dir1) && canWrite(dir1)) return dir1;
@@ -107,14 +95,12 @@ function resolveBaseDir() {
     return dir2;
   }
 
-  // Outros SOs (fallback simples)
   const home = process.env.HOME || process.env.USERPROFILE || process.cwd();
   const dir = path.join(home, ".lookout");
   ensureDir(dir);
   return dir;
 }
 
-// ✅ Resolvido uma vez (evita inconsistência de paths)
 const BASE_DIR = resolveBaseDir();
 const CONFIG_PATH = path.join(BASE_DIR, "agent-config.json");
 const LOCK_PATH = path.join(BASE_DIR, "agent.lock");
@@ -122,7 +108,6 @@ const LOCK_PATH = path.join(BASE_DIR, "agent.lock");
 // ============================
 // LOCK GLOBAL (ANTI-MULTI-SESSION)
 // ============================
-
 function processExists(pid) {
   if (!pid || typeof pid !== "number") return false;
   try {
@@ -134,52 +119,42 @@ function processExists(pid) {
 }
 
 function tryAcquireGlobalLock() {
-  // 1) Se existe lock, tenta entender se é órfão (crash)
   if (fs.existsSync(LOCK_PATH)) {
     try {
       const raw = fs.readFileSync(LOCK_PATH, "utf8");
       const info = JSON.parse(raw);
       const ownerPid = Number(info?.pid);
 
-      // Se o PID ainda existe, bloqueia (outro agent já é o dono)
       if (processExists(ownerPid)) {
         return { ok: false, reason: "lock_exists", owner: info };
       }
 
-      // Se não existe, lock órfão: remove e tenta adquirir
       try {
         fs.unlinkSync(LOCK_PATH);
-      } catch { }
+      } catch {}
     } catch {
-      // Lock corrompido: tenta remover
       try {
         fs.unlinkSync(LOCK_PATH);
-      } catch { }
+      } catch {}
     }
   }
 
-  // 2) Cria lock exclusivo
   try {
-    const fd = fs.openSync(LOCK_PATH, "wx"); // falha se já existir
+    const fd = fs.openSync(LOCK_PATH, "wx");
     const owner = {
       pid: process.pid,
       startedAt: new Date().toISOString(),
       version: AGENT_VERSION,
       platform: process.platform,
       baseDir: BASE_DIR,
-
-      // Windows
       session: process.env.SESSIONNAME || null,
       username: process.env.USERNAME || null,
-
-      // Linux/mac
-      user: process.env.USER || null
+      user: process.env.USER || null,
     };
     fs.writeFileSync(fd, JSON.stringify(owner, null, 2));
     fs.closeSync(fd);
     return { ok: true, owner };
   } catch {
-    // Se alguém criou entre o check e o openSync
     try {
       const raw = fs.readFileSync(LOCK_PATH, "utf8");
       return { ok: false, reason: "lock_exists", owner: JSON.parse(raw) };
@@ -197,20 +172,19 @@ function releaseGlobalLock() {
     if (Number(info?.pid) === process.pid) {
       fs.unlinkSync(LOCK_PATH);
     }
-  } catch { }
+  } catch {}
 }
 
 // ============================
-// DEVICE ID PERSISTENTE (GLOBAL QUANDO POSSÍVEL)
+// DEVICE ID PERSISTENTE
 // ============================
-
 function getOrCreateDeviceId() {
   try {
     if (fs.existsSync(CONFIG_PATH)) {
       const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
       if (cfg.deviceId) return cfg.deviceId;
     }
-  } catch { }
+  } catch {}
 
   const deviceId = "device-" + crypto.randomUUID();
   const cfg = {
@@ -218,12 +192,12 @@ function getOrCreateDeviceId() {
     createdAt: new Date().toISOString(),
     version: AGENT_VERSION,
     platform: process.platform,
-    baseDir: BASE_DIR
+    baseDir: BASE_DIR,
   };
 
   try {
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
-  } catch { }
+  } catch {}
 
   return deviceId;
 }
@@ -231,54 +205,74 @@ function getOrCreateDeviceId() {
 const DEVICE_ID = getOrCreateDeviceId();
 
 // ============================
-// UI (mínima, debug)
+// UI (bonita - loadFile + frame custom)
 // ============================
-
 let mainWindow = null;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 460,
-    height: 240,
+    width: 940,
+    height: 620,
     resizable: false,
     show: true,
+    backgroundColor: "#05070b",
+    frame: false, // ✅ barra custom igual ao print
+    autoHideMenuBar: true,
     webPreferences: {
-      contextIsolation: true
-    }
+      contextIsolation: true,
+      preload: path.join(__dirname, "preload.js"), // ✅ necessário pro minimizar/fechar
+    },
   });
 
-  const html = `
-    <html>
-      <body style="font-family:Arial;padding:16px">
-        <h2>Lookout Agent</h2>
-        <div>Device ID: <b>${DEVICE_ID}</b></div>
-        <div>Versão: ${AGENT_VERSION}</div>
-        <div>BaseDir: <code>${BASE_DIR}</code></div>
-        <div id="st" style="margin-top:10px;padding:10px;border:1px solid #ccc">
-          Conectando...
-        </div>
-      </body>
-    </html>
-  `;
+  // ✅ carrega o HTML real (assim a imagem eye-cyber.png funciona)
+  mainWindow.loadFile(path.join(__dirname, "index.html"));
 
-  mainWindow.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(html));
+  // ✅ injeta valores iniciais no DOM
+  mainWindow.webContents.on("did-finish-load", () => {
+    setText("deviceId", DEVICE_ID);
+    setText("version", AGENT_VERSION);
+    setText("statusLabel", "CONECTADO");
+    setStatus("Conectado ✅");
+  });
+}
+
+function setText(id, value) {
+  try {
+    if (!mainWindow) return;
+    const safe = String(value ?? "")
+      .replace(/\\/g, "\\\\")
+      .replace(/`/g, "\\`");
+    mainWindow.webContents.executeJavaScript(
+      `(function(){ const el=document.getElementById(${JSON.stringify(id)}); if(el) el.innerText=\`${safe}\`; })();`,
+      true
+    );
+  } catch {}
 }
 
 function setStatus(text) {
-  try {
-    if (!mainWindow) return;
-    const safe = String(text).replace(/`/g, "\\`");
-    mainWindow.webContents.executeJavaScript(
-      `document.getElementById('st').innerText = \`${safe}\`;`,
-      true
-    );
-  } catch { }
+  setText("st", text);
 }
+
+function setMini(id, value) {
+  setText(id, value);
+}
+
+// ✅ IPC dos botões da titlebar custom (preload chama isso)
+ipcMain.on("window:minimize", () => {
+  try {
+    mainWindow?.minimize();
+  } catch {}
+});
+
+ipcMain.on("window:close", () => {
+  try {
+    mainWindow?.close();
+  } catch {}
+});
 
 // ============================
 // WEBSOCKET
 // ============================
-
 const HEARTBEAT_MS = 5000;
 let ws = null;
 let heartbeat = null;
@@ -309,12 +303,58 @@ function scheduleReconnect() {
   reconnectTimer = setTimeout(connectWs, 2000);
 }
 
+// ============================
+// CONSENT + STREAM STATE (sessão)
+// ============================
+let consentGranted = false; // ✅ aceitou nessa sessão
+let viewerActive = false; // ✅ backend disse stream-enable
+let streaming = false;
+
+// ✅ PATCH: evita abrir múltiplos prompts de consent ao mesmo tempo
+let consentPromptOpen = false;
+
+// ✅ PATCH: consent automático quando viewer abre (mesmo sem request_remote_access)
+async function ensureConsentForViewer() {
+  if (consentGranted) return true;
+  if (consentPromptOpen) return false;
+
+  consentPromptOpen = true;
+  try {
+    const res = await dialog.showMessageBox({
+      type: "question",
+      buttons: ["Permitir", "Recusar"],
+      defaultId: 0,
+      cancelId: 1,
+      title: "Pedido de Visualização",
+      message: `Um administrador abriu a visualização da sua tela.`,
+      detail: `Deseja permitir o streaming da tela nesta sessão?`,
+    });
+
+    const accepted = res.response === 0;
+
+    if (accepted) {
+      consentGranted = true;
+      setMini("consent", "ACEITO (sessão)");
+      setStatus("Consentimento ACEITO ✅ (viewer)");
+      return true;
+    }
+
+    consentGranted = false;
+    setMini("consent", "NÃO");
+    setStatus("Consentimento recusado (viewer). Stream continuará parado.");
+    stopStreaming();
+    return false;
+  } finally {
+    consentPromptOpen = false;
+  }
+}
+
 function connectWs() {
   if (ws) {
     try {
       ws.removeAllListeners();
       ws.close();
-    } catch { }
+    } catch {}
   }
 
   setStatus("Conectando...");
@@ -326,7 +366,11 @@ function connectWs() {
     setStatus("Conectado ✅");
   });
 
-  ws.on("message", async (raw) => {
+  // ✅ PATCH: ws.on("message") pode receber (data, isBinary)
+  ws.on("message", async (raw, isBinary) => {
+    // se algum dia chegar binário do backend, ignore (nosso protocolo é JSON do backend → agent)
+    if (isBinary) return;
+
     let msg;
     try {
       msg = JSON.parse(raw.toString());
@@ -336,25 +380,85 @@ function connectWs() {
 
     if (msg.type === "pong") return;
 
+    // ✅ PATCH: aceitar variações com underscore também
+    const t = String(msg.type || "");
+
+    const isStreamEnable = t === "stream-enable" || t === "stream_enable";
+    const isStreamDisable = t === "stream-disable" || t === "stream_disable";
+
+    // ✅ backend abriu viewer (MJPEG)
+    if (isStreamEnable) {
+      viewerActive = true;
+      setMini("viewer", "ABERTO");
+      setStatus(`Viewer abriu (${t}) ✅`);
+
+      // ✅ PATCH: se não tem consent ainda, pede automaticamente (1x na sessão)
+      if (!consentGranted) {
+        const ok = await ensureConsentForViewer();
+        if (!ok) return;
+      }
+
+      startStreaming();
+      return;
+    }
+
+    // ✅ backend fechou viewer (MJPEG)
+    if (isStreamDisable) {
+      viewerActive = false;
+      setMini("viewer", "nenhum");
+      setStatus(`Viewer fechou (${t}). Stream parado.`);
+
+      stopStreaming();
+
+      // ✅ regra pedida: se site/viewer fechou, pede consent de novo na próxima vez
+      consentGranted = false;
+      setMini("consent", "NÃO");
+      return;
+    }
+
+    // ✅ pedido de consentimento (Suporte)
     if (msg.type === "consent_request") {
+      // Se já aceitou nessa sessão, não pergunta de novo
+      if (consentGranted) {
+        try {
+          ws.send(JSON.stringify({ type: "consent_response", accepted: true }));
+        } catch {}
+        setStatus(`Auto-consent ✅ (admin: ${msg.admin || "?"})`);
+
+        // só faz stream se viewer estiver ativo
+        if (viewerActive) startStreaming();
+        return;
+      }
+
       const res = await dialog.showMessageBox({
         type: "question",
         buttons: ["Permitir", "Recusar"],
         defaultId: 0,
         cancelId: 1,
         title: "Pedido de Suporte",
-        message: `Administrador "${msg.admin}" solicitou acesso remoto.`
+        message: `Administrador "${msg.admin}" solicitou acesso remoto.`,
       });
 
-      ws.send(
-        JSON.stringify({
-          type: "consent_response",
-          accepted: res.response === 0
-        })
-      );
+      const accepted = res.response === 0;
 
-      if (res.response === 0) startStreaming();
-      else stopStreaming();
+      try {
+        ws.send(JSON.stringify({ type: "consent_response", accepted }));
+      } catch {}
+
+      if (accepted) {
+        consentGranted = true;
+        setMini("consent", "ACEITO (sessão)");
+        setStatus("Consentimento ACEITO ✅");
+
+        // só faz stream se viewer estiver ativo
+        if (viewerActive) startStreaming();
+      } else {
+        consentGranted = false;
+        setMini("consent", "NÃO");
+        setStatus("Consentimento recusado.");
+        stopStreaming();
+      }
+      return;
     }
   });
 
@@ -363,53 +467,81 @@ function connectWs() {
     stopStreaming();
     mainWindow?.setTitle("Lookout Agent - desconectado");
     setStatus("Desconectado. Reconectando...");
+
+    // ✅ ao cair conexão, reseta sessão
+    consentGranted = false;
+    viewerActive = false;
+    consentPromptOpen = false;
+    setMini("consent", "NÃO");
+    setMini("viewer", "nenhum");
+    setMini("stream", "parado");
+
     scheduleReconnect();
   });
 
   ws.on("error", () => {
-    // Evita crash por erro de rede
     try {
       ws.close();
-    } catch { }
+    } catch {}
   });
 }
 
 // ============================
-// SCREEN STREAM
+// SCREEN STREAM (BINÁRIO JPEG)
 // ============================
+const FPS_MS = 250; // ~4 fps
+const THUMB_W = 960;
+const THUMB_H = 540;
+const JPEG_QUALITY = 45; // 0..100 (Buffer)
 
-let streaming = false;
-
-async function sendFrame() {
-  if (!ws || ws.readyState !== WebSocket.OPEN || !streaming) return;
-
+async function captureJpegBuffer() {
   const sources = await desktopCapturer.getSources({
     types: ["screen"],
-    thumbnailSize: { width: 960, height: 540 }
+    thumbnailSize: { width: THUMB_W, height: THUMB_H },
   });
 
-  if (!sources.length) return;
+  if (!sources.length) return null;
 
-  ws.send(
-    JSON.stringify({
-      type: "frame",
-      jpegBase64: sources[0].thumbnail.toDataURL("image/jpeg", 0.45)
-    })
-  );
+  // ✅ Buffer JPEG direto (sem base64)
+  const img = sources[0].thumbnail;
+  const buf = img.toJPEG(JPEG_QUALITY);
+  return buf && buf.length ? buf : null;
+}
+
+async function sendFrameBinary() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!streaming) return;
+  if (!viewerActive) return; // gating
+  if (!consentGranted) return; // precisa consent
+
+  try {
+    const buf = await captureJpegBuffer();
+    if (!buf) return;
+
+    // ✅ envia binário direto
+    ws.send(buf, { binary: true });
+  } catch {}
 }
 
 function startStreaming() {
   if (streaming) return;
   streaming = true;
+  setMini("stream", "rodando ✅");
 
   const loop = async () => {
     if (!streaming) return;
-    await sendFrame();
-    setTimeout(loop, 250); // ~4 FPS (internet-friendly)
+    await sendFrameBinary();
+    setTimeout(loop, FPS_MS);
   };
 
   loop();
 }
+
+function stopStreaming() {
+  streaming = false;
+  setMini("stream", "parado");
+}
+
 // ============================
 // APP
 // ============================
@@ -419,20 +551,18 @@ const gotSingleInstance = app.requestSingleInstanceLock();
 if (!gotSingleInstance) {
   try {
     app.quit();
-  } catch { }
+  } catch {}
 }
 
 app.whenReady().then(async () => {
-  // 1) LOCK GLOBAL
   const lock = tryAcquireGlobalLock();
   if (!lock.ok) {
     try {
       app.quit();
-    } catch { }
+    } catch {}
     return;
   }
 
-  // 2) UI + conexão
   createWindow();
   connectWs();
 });
@@ -441,7 +571,7 @@ app.on("before-quit", () => {
   try {
     stopHeartbeat();
     stopStreaming();
-  } catch { }
+  } catch {}
   releaseGlobalLock();
 });
 

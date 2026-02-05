@@ -53,7 +53,6 @@ function getBackendBaseFromWindow() {
   }
 }
 
-
 const { HTTP_BASE, WS_BASE } = getBackendBaseFromWindow();
 
 /**
@@ -113,6 +112,30 @@ function applyPresencePatch(prevById, patch) {
 
 /**
  * ============================================
+ * DETECT MOBILE (pra escolher MJPEG x FRAME)
+ * ============================================
+ */
+function isProbablyMobile() {
+  try {
+    const ua = String(navigator.userAgent || "").toLowerCase();
+    const byUa =
+      ua.includes("android") ||
+      ua.includes("iphone") ||
+      ua.includes("ipad") ||
+      ua.includes("ipod") ||
+      ua.includes("mobile");
+
+    // pointer coarse ajuda em tablets/celulares
+    const byPointer = !!window.matchMedia?.("(pointer: coarse)")?.matches;
+
+    return byUa || byPointer;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * ============================================
  * MiniModal (para "Criador")
  * ============================================
  */
@@ -167,18 +190,60 @@ function Modal({ open, title, onClose, children }) {
 
 /**
  * ============================================
- * ScreenViewer
+ * ScreenViewer (MJPEG desktop + FRAME mobile)
  * ============================================
  */
 function ScreenViewer({ deviceId, displayName, onClose }) {
-  const [tick, setTick] = useState(0);
   const viewerRef = useRef(null);
 
+  // ✅ modo padrão:
+  // - mobile -> frame (polling)
+  // - desktop -> mjpeg
+  const [mode, setMode] = useState(() => (isProbablyMobile() ? "frame" : "mjpeg"));
+
+  // tick usado para cache-busting no modo frame
+  const [tick, setTick] = useState(0);
+
+  // controla se o MJPEG falhou (pra cair no frame)
+  const [mjpegFailed, setMjpegFailed] = useState(false);
+
+  const token = localStorage.getItem("lookout_token") || "";
+
+  const mjpegUrl = useMemo(() => {
+    if (!deviceId) return "";
+    return (
+      `${HTTP_BASE}/api/devices/${encodeURIComponent(deviceId)}/mjpeg` +
+      `?token=${encodeURIComponent(token)}`
+    );
+  }, [deviceId, token]);
+
+  const frameUrl = useMemo(() => {
+    if (!deviceId) return "";
+    // ✅ cache-buster: t=...
+    return (
+      `${HTTP_BASE}/api/devices/${encodeURIComponent(deviceId)}/frame` +
+      `?token=${encodeURIComponent(token)}` +
+      `&t=${encodeURIComponent(String(tick))}`
+    );
+  }, [deviceId, token, tick]);
+
+  // ✅ polling só no modo frame
   useEffect(() => {
     if (!deviceId) return;
-    const t = setInterval(() => setTick((x) => x + 1), 150);
+    if (mode !== "frame") return;
+
+    // 300ms ~= 3.3 fps (bom pra mobile e 4G/5G)
+    const intervalMs = 300;
+    const t = setInterval(() => setTick((x) => x + 1), intervalMs);
     return () => clearInterval(t);
-  }, [deviceId]);
+  }, [deviceId, mode]);
+
+  // se MJPEG falhou, força modo frame (fallback automático)
+  useEffect(() => {
+    if (!deviceId) return;
+    if (!mjpegFailed) return;
+    setMode("frame");
+  }, [deviceId, mjpegFailed]);
 
   const enterFullscreen = async () => {
     const el = viewerRef.current;
@@ -202,13 +267,14 @@ function ScreenViewer({ deviceId, displayName, onClose }) {
   const closeViewer = async () => {
     await exitFullscreen();
     if (typeof onClose === "function") onClose();
+    setMjpegFailed(false);
+    setTick(0);
+    setMode(isProbablyMobile() ? "frame" : "mjpeg");
   };
 
   if (!deviceId) return null;
 
-const frameUrl =
-  `${HTTP_BASE}/api/devices/${encodeURIComponent(deviceId)}/mjpeg` +
-  `?token=${encodeURIComponent(localStorage.getItem("lookout_token") || "")}`;
+  const activeUrl = mode === "mjpeg" ? mjpegUrl : frameUrl;
 
   return (
     <div className="panel" style={{ marginTop: 18 }}>
@@ -220,32 +286,70 @@ const frameUrl =
               ({deviceId})
             </span>
           </div>
+
           <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
             Dica: duplo clique para tela cheia. ESC para sair do fullscreen.
+            <span style={{ marginLeft: 10 }}>
+              Modo: <b>{mode === "mjpeg" ? "MJPEG" : "FRAME"}</b>
+              {mjpegFailed ? <span style={{ marginLeft: 8 }}>⚠️ MJPEG falhou, usando FRAME</span> : null}
+            </span>
           </div>
         </div>
 
-        <div className="row" style={{ gap: 8 }}>
+        <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
           <button className="btn" onClick={enterFullscreen}>
             Tela cheia
           </button>
 
-          <button className="btn" onClick={exitFullscreen} title="Sai do fullscreen, mas mantém o viewer aberto">
+          <button
+            className="btn"
+            onClick={exitFullscreen}
+            title="Sai do fullscreen, mas mantém o viewer aberto"
+          >
             Sair tela cheia
           </button>
 
-          <button className="btn" onClick={closeViewer} title="Fecha o viewer e limpa a seleção">
+          <button
+            className="btn"
+            onClick={() => {
+              // alterna manualmente (útil pra testes)
+              setMjpegFailed(false);
+              setMode((m) => (m === "mjpeg" ? "frame" : "mjpeg"));
+            }}
+            title="Alterna MJPEG/FRAME"
+          >
+            Alternar modo
+          </button>
+
+          <button
+            className="btn"
+            onClick={closeViewer}
+            title="Fecha o viewer e limpa a seleção"
+          >
             Fechar
           </button>
 
-          <button className="btn red" onClick={() => window.open(frameUrl, "_blank")}>
+          <button className="btn red" onClick={() => window.open(activeUrl, "_blank")}>
             Abrir em nova guia
           </button>
         </div>
       </div>
 
-      <div ref={viewerRef} onDoubleClick={enterFullscreen} className="viewer" title="Duplo clique para tela cheia">
-        <img src={frameUrl} alt="screen" className="viewer-img" />
+      <div
+        ref={viewerRef}
+        onDoubleClick={enterFullscreen}
+        className="viewer"
+        title="Duplo clique para tela cheia"
+      >
+        <img
+          src={activeUrl}
+          alt="screen"
+          className="viewer-img"
+          onError={() => {
+            // ✅ se MJPEG falhar (muito comum em mobile), cai pro frame automaticamente
+            if (mode === "mjpeg") setMjpegFailed(true);
+          }}
+        />
       </div>
     </div>
   );
@@ -425,7 +529,6 @@ function App() {
 
     setToken(data.token || "");
     setUser(data.user || null);
-
   };
 
   const logout = () => {
@@ -450,7 +553,6 @@ function App() {
     localStorage.removeItem("lookout_user");
     setToken("");
     setUser(null);
-
   };
 
   /**
@@ -473,8 +575,6 @@ function App() {
     const list = await res.json();
     setDevicesById(arrayToMapById(list));
   };
-
-
 
   const fetchLogs = async (authToken) => {
     if (!authToken) return;
@@ -523,7 +623,6 @@ function App() {
     setAliasesById(normalized);
   };
 
-
   const fetchComplianceEvents = async (authToken, deviceIdFilter) => {
     const headers = { Authorization: `Bearer ${authToken}` };
     const q = deviceIdFilter ? `?deviceId=${encodeURIComponent(deviceIdFilter)}` : "";
@@ -542,7 +641,6 @@ function App() {
     fetchData(token);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
-
 
   /**
    * ============================================
@@ -768,27 +866,15 @@ function App() {
 
             {/* ✅ NAV sem <a href="#"> pra não gerar warning */}
             <nav className="nav">
-              <button
-                type="button"
-                className={activeTab === "devices" ? "active" : ""}
-                onClick={() => navigate("devices")}
-              >
+              <button type="button" className={activeTab === "devices" ? "active" : ""} onClick={() => navigate("devices")}>
                 Dispositivos
               </button>
 
-              <button
-                type="button"
-                className={activeTab === "logs" ? "active" : ""}
-                onClick={() => navigate("logs")}
-              >
+              <button type="button" className={activeTab === "logs" ? "active" : ""} onClick={() => navigate("logs")}>
                 Logs
               </button>
 
-              <button
-                type="button"
-                className={activeTab === "settings" ? "active" : ""}
-                onClick={() => navigate("settings")}
-              >
+              <button type="button" className={activeTab === "settings" ? "active" : ""} onClick={() => navigate("settings")}>
                 Configurações
               </button>
             </nav>
