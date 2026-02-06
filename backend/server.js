@@ -60,7 +60,7 @@ app.use((req, _res, next) => {
   next();
 });
 
-// ✅ Mantém compatível com seu setup atual,
+// Mantém compatível com seu setup atual,
 // mas permite trocar sem refatorar depois (via variável de ambiente).
 const JWT_SECRET = process.env.JWT_SECRET || "supersecretkey";
 const PORT = Number(process.env.PORT || 3001);
