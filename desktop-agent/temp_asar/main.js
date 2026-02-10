@@ -131,11 +131,11 @@ function tryAcquireGlobalLock() {
 
       try {
         fs.unlinkSync(LOCK_PATH);
-      } catch { }
+      } catch {}
     } catch {
       try {
         fs.unlinkSync(LOCK_PATH);
-      } catch { }
+      } catch {}
     }
   }
 
@@ -172,7 +172,7 @@ function releaseGlobalLock() {
     if (Number(info?.pid) === process.pid) {
       fs.unlinkSync(LOCK_PATH);
     }
-  } catch { }
+  } catch {}
 }
 
 // ============================
@@ -184,7 +184,7 @@ function getOrCreateDeviceId() {
       const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
       if (cfg.deviceId) return cfg.deviceId;
     }
-  } catch { }
+  } catch {}
 
   const deviceId = "device-" + crypto.randomUUID();
   const cfg = {
@@ -197,7 +197,7 @@ function getOrCreateDeviceId() {
 
   try {
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
-  } catch { }
+  } catch {}
 
   return deviceId;
 }
@@ -211,8 +211,8 @@ let mainWindow = null;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 520,
-    height: 500,
+    width: 940,
+    height: 620,
     resizable: false,
     show: true,
     backgroundColor: "#05070b",
@@ -246,7 +246,7 @@ function setText(id, value) {
       `(function(){ const el=document.getElementById(${JSON.stringify(id)}); if(el) el.innerText=\`${safe}\`; })();`,
       true
     );
-  } catch { }
+  } catch {}
 }
 
 function setStatus(text) {
@@ -261,13 +261,13 @@ function setMini(id, value) {
 ipcMain.on("window:minimize", () => {
   try {
     mainWindow?.minimize();
-  } catch { }
+  } catch {}
 });
 
 ipcMain.on("window:close", () => {
   try {
     mainWindow?.close();
-  } catch { }
+  } catch {}
 });
 
 // ============================
@@ -354,7 +354,7 @@ function connectWs() {
     try {
       ws.removeAllListeners();
       ws.close();
-    } catch { }
+    } catch {}
   }
 
   setStatus("Conectando...");
@@ -422,7 +422,7 @@ function connectWs() {
       if (consentGranted) {
         try {
           ws.send(JSON.stringify({ type: "consent_response", accepted: true }));
-        } catch { }
+        } catch {}
         setStatus(`Auto-consent ✅ (admin: ${msg.admin || "?"})`);
 
         // só faz stream se viewer estiver ativo
@@ -443,7 +443,7 @@ function connectWs() {
 
       try {
         ws.send(JSON.stringify({ type: "consent_response", accepted }));
-      } catch { }
+      } catch {}
 
       if (accepted) {
         consentGranted = true;
@@ -482,7 +482,7 @@ function connectWs() {
   ws.on("error", () => {
     try {
       ws.close();
-    } catch { }
+    } catch {}
   });
 }
 
@@ -520,7 +520,7 @@ async function sendFrameBinary() {
 
     // ✅ envia binário direto
     ws.send(buf, { binary: true });
-  } catch { }
+  } catch {}
 }
 
 function startStreaming() {
@@ -551,7 +551,7 @@ const gotSingleInstance = app.requestSingleInstanceLock();
 if (!gotSingleInstance) {
   try {
     app.quit();
-  } catch { }
+  } catch {}
 }
 
 app.whenReady().then(async () => {
@@ -559,7 +559,7 @@ app.whenReady().then(async () => {
   if (!lock.ok) {
     try {
       app.quit();
-    } catch { }
+    } catch {}
     return;
   }
 
@@ -571,7 +571,7 @@ app.on("before-quit", () => {
   try {
     stopHeartbeat();
     stopStreaming();
-  } catch { }
+  } catch {}
   releaseGlobalLock();
 });
 

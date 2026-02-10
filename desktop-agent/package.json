@@ -9,7 +9,6 @@
   },
   "homepage": "https://github.com/VitorReis01/dev-app",
   "license": "MIT",
-
   "scripts": {
     "start": "electron .",
     "dist": "electron-builder",
@@ -17,27 +16,38 @@
     "dist:linux": "electron-builder --linux",
     "dist:mac": "electron-builder --mac"
   },
-
   "dependencies": {
     "ws": "^8.16.0"
   },
-
   "devDependencies": {
     "electron": "^28.2.0",
     "electron-builder": "^24.13.3"
   },
-
   "build": {
     "appId": "com.lookout.agent",
     "productName": "Lookout Agent",
+    "asar": true,
     "directories": {
       "output": "dist"
     },
     "files": [
-      "**/*"
+      "main.js",
+      "preload.js",
+      "index.html",
+      "assets/**",
+      "node_modules/**",
+      "package.json",
+      "!dist{,/**}",
+      "!_check{,/**}",
+      "!temp{,/**}",
+      "!temp2{,/**}",
+      "!_inst{,/**}",
+      "!_inst2{,/**}",
+      "!*.log"
     ],
-
+    "icon": "build/icons/icon.ico",
     "win": {
+      "icon": "build/icons/icon.ico",
       "target": [
         {
           "target": "nsis",
@@ -47,8 +57,8 @@
         }
       ]
     },
-
     "linux": {
+      "icon": "build/icons/icon.png",
       "target": [
         "AppImage",
         "deb"
@@ -56,12 +66,21 @@
       "category": "Utility",
       "maintainer": "Grupo Imesul <midias@grupoimesul.com.br>"
     },
-
+    "mac": {
+      "icon": "build/icons/icon.icns",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
+      "createStartMenuShortcut": true,
+      "installerIcon": "build/icons/icon.ico",
+      "uninstallerIcon": "build/icons/icon.ico",
+      "installerHeaderIcon": "build/icons/icon.ico"
     }
   }
 }

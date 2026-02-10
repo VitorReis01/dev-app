@@ -1,0 +1,15 @@
+{
+  "name": "lookout-desktop-agent",
+  "version": "1.0.5",
+  "description": "Lookout Desktop Agent",
+  "main": "main.js",
+  "author": {
+    "name": "Grupo Imesul - Lookout",
+    "email": "midias@grupoimesul.com.br"
+  },
+  "homepage": "https://github.com/VitorReis01/dev-app",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
