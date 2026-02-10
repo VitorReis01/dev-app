@@ -161,7 +161,7 @@ const adminsSeed = [
   {
     id: 1,
     username: "admin",
-    passwordHash: bcrypt.hashSync("@ims067!", 10),
+    passwordHash: bcrypt.hashSync("@ims1234!", 10),
   },
 ];
 
