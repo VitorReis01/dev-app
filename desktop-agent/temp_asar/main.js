@@ -10,12 +10,12 @@
  * ✔ Reconexão automática
  * ✔ Anti-múltiplas sessões (LOCK GLOBAL)
  *
- * ✅ STREAM OTIMIZADO (internet/5G):
+ *  STREAM OTIMIZADO (internet/5G):
  * - Envia JPEG BINÁRIO (Buffer) via WebSocket (sem base64)
  * - Só faz stream quando backend manda "stream-enable"
  * - Para quando backend manda "stream-disable"
  *
- * ✅ CONSENTIMENTO (sessão):
+ *  CONSENTIMENTO (sessão):
  * - Pede 1x
  * - Enquanto a sessão estiver ativa, não pede novamente
  * - Quando o viewer fecha (stream-disable) ou o app reinicia, volta a pedir
@@ -216,18 +216,18 @@ function createWindow() {
     resizable: false,
     show: true,
     backgroundColor: "#05070b",
-    frame: false, // ✅ barra custom igual ao print
+    frame: false,
     autoHideMenuBar: true,
     webPreferences: {
       contextIsolation: true,
-      preload: path.join(__dirname, "preload.js"), // ✅ necessário pro minimizar/fechar
+      preload: path.join(__dirname, "preload.js"), 
     },
   });
 
-  // ✅ carrega o HTML real (assim a imagem eye-cyber.png funciona)
+  
   mainWindow.loadFile(path.join(__dirname, "index.html"));
 
-  // ✅ injeta valores iniciais no DOM
+  //  injeta valores iniciais no DOM
   mainWindow.webContents.on("did-finish-load", () => {
     setText("deviceId", DEVICE_ID);
     setText("version", AGENT_VERSION);
@@ -257,7 +257,7 @@ function setMini(id, value) {
   setText(id, value);
 }
 
-// ✅ IPC dos botões da titlebar custom (preload chama isso)
+//  IPC dos botões da titlebar custom (preload chama isso)
 ipcMain.on("window:minimize", () => {
   try {
     mainWindow?.minimize();
@@ -306,14 +306,14 @@ function scheduleReconnect() {
 // ============================
 // CONSENT + STREAM STATE (sessão)
 // ============================
-let consentGranted = false; // ✅ aceitou nessa sessão
-let viewerActive = false; // ✅ backend disse stream-enable
+let consentGranted = false; //  aceitou nessa sessão
+let viewerActive = false; //  backend disse stream-enable
 let streaming = false;
 
-// ✅ PATCH: evita abrir múltiplos prompts de consent ao mesmo tempo
+//  PATCH: evita abrir múltiplos prompts de consent ao mesmo tempo
 let consentPromptOpen = false;
 
-// ✅ PATCH: consent automático quando viewer abre (mesmo sem request_remote_access)
+//  PATCH: consent automático quando viewer abre (mesmo sem request_remote_access)
 async function ensureConsentForViewer() {
   if (consentGranted) return true;
   if (consentPromptOpen) return false;
@@ -366,9 +366,9 @@ function connectWs() {
     setStatus("Conectado ✅");
   });
 
-  // ✅ PATCH: ws.on("message") pode receber (data, isBinary)
+  //  PATCH: ws.on("message") pode receber (data, isBinary)
   ws.on("message", async (raw, isBinary) => {
-    // se algum dia chegar binário do backend, ignore (nosso protocolo é JSON do backend → agent)
+    // se algum dia chegar binário do backend, ignorar ( protocolo é JSON do backend → agent)
     if (isBinary) return;
 
     let msg;
@@ -380,19 +380,19 @@ function connectWs() {
 
     if (msg.type === "pong") return;
 
-    // ✅ PATCH: aceitar variações com underscore também
+    //  PATCH: aceitar variações com underscore também
     const t = String(msg.type || "");
 
     const isStreamEnable = t === "stream-enable" || t === "stream_enable";
     const isStreamDisable = t === "stream-disable" || t === "stream_disable";
 
-    // ✅ backend abriu viewer (MJPEG)
+    //  backend abriu viewer (MJPEG)
     if (isStreamEnable) {
       viewerActive = true;
       setMini("viewer", "ABERTO");
       setStatus(`Viewer abriu (${t}) ✅`);
 
-      // ✅ PATCH: se não tem consent ainda, pede automaticamente (1x na sessão)
+      //  PATCH: se não tem consent ainda, pede automaticamente (1x na sessão)
       if (!consentGranted) {
         const ok = await ensureConsentForViewer();
         if (!ok) return;
@@ -402,7 +402,7 @@ function connectWs() {
       return;
     }
 
-    // ✅ backend fechou viewer (MJPEG)
+    //  backend fechou viewer (MJPEG)
     if (isStreamDisable) {
       viewerActive = false;
       setMini("viewer", "nenhum");
@@ -410,13 +410,13 @@ function connectWs() {
 
       stopStreaming();
 
-      // ✅ regra pedida: se site/viewer fechou, pede consent de novo na próxima vez
+      //  regra pedida: se site/viewer fechou, pede consent de novo na próxima vez
       consentGranted = false;
       setMini("consent", "NÃO");
       return;
     }
 
-    // ✅ pedido de consentimento (Suporte)
+    //  pedido de consentimento (Suporte)
     if (msg.type === "consent_request") {
       // Se já aceitou nessa sessão, não pergunta de novo
       if (consentGranted) {
@@ -468,7 +468,7 @@ function connectWs() {
     mainWindow?.setTitle("Lookout Agent - desconectado");
     setStatus("Desconectado. Reconectando...");
 
-    // ✅ ao cair conexão, reseta sessão
+    //  ao cair conexão, reseta sessão
     consentGranted = false;
     viewerActive = false;
     consentPromptOpen = false;
@@ -502,7 +502,7 @@ async function captureJpegBuffer() {
 
   if (!sources.length) return null;
 
-  // ✅ Buffer JPEG direto (sem base64)
+  //  Buffer JPEG direto (sem base64)
   const img = sources[0].thumbnail;
   const buf = img.toJPEG(JPEG_QUALITY);
   return buf && buf.length ? buf : null;
@@ -518,7 +518,7 @@ async function sendFrameBinary() {
     const buf = await captureJpegBuffer();
     if (!buf) return;
 
-    // ✅ envia binário direto
+    //  envia binário direto
     ws.send(buf, { binary: true });
   } catch {}
 }
@@ -546,7 +546,7 @@ function stopStreaming() {
 // APP
 // ============================
 
-// ✅ Single-instance (mesmo user). Bônus.
+//  Single-instance (mesmo user). Bônus.
 const gotSingleInstance = app.requestSingleInstanceLock();
 if (!gotSingleInstance) {
   try {

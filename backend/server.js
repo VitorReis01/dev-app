@@ -171,7 +171,7 @@ const adminsSeed = [
 const devices = []; // { id, connected, lastSeen, agentVersion }
 const wsAgentsByDeviceId = new Map();
 
-// ✅ Agora pode guardar:
+//  pode guardar:
 // - string base64 / dataURL (modo antigo)
 // - OU Buffer (modo novo binário)
 const lastFrameByDevice = Object.create(null);
@@ -182,7 +182,7 @@ const MIN_FRAME_INTERVAL_MS = 250; // 4fps máximo
 
 const PRESENCE_TTL_MS = 15000;
 
-// ✅ viewers MJPEG por device (para gating do stream)
+//  viewers MJPEG por device (para gating do stream)
 const mjpegViewersByDevice = Object.create(null);
 
 // ============================
@@ -259,7 +259,7 @@ function decMjpegViewer(deviceId) {
   return n;
 }
 
-// ✅ compat: envia os 2 nomes (hífen e underscore)
+// compat: envia os 2 nomes (hífen e underscore)
 function sendStreamEnable(agentWs, deviceId) {
   if (!agentWs) return;
   safeSend(agentWs, { type: "stream-enable" });
@@ -275,7 +275,7 @@ function sendStreamDisable(agentWs, deviceId) {
 }
 
 // ============================
-// ✅ ADMIN CONSOLE (React build) (ANTES do fallback)
+//  ADMIN CONSOLE (React build) (ANTES do fallback)
 // ============================
 const ADMIN_BUILD_DIR = path.join(__dirname, "..", "admin-console", "build");
 const ADMIN_INDEX_HTML = path.join(ADMIN_BUILD_DIR, "index.html");
@@ -288,7 +288,7 @@ if (fs.existsSync(ADMIN_BUILD_DIR)) {
 }
 
 // ============================
-// ✅ Health check (sem auth)
+//  Health check (sem auth)
 // ============================
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, ts: Date.now() });
@@ -374,7 +374,7 @@ app.get("/api/logs", authenticateAdmin, (_req, res) => {
   res.json(logs);
 });
 
-// ✅ rota única do frame (1 imagem JPEG)
+//  rota única do frame (1 imagem JPEG)
 app.get("/api/devices/:deviceId/frame", authenticateAdminFlex, (req, res) => {
   const deviceId = normDeviceId(req.params.deviceId);
   const frameRaw = lastFrameByDevice[deviceId];
@@ -403,7 +403,7 @@ app.get("/api/devices/:deviceId/frame", authenticateAdminFlex, (req, res) => {
   }
 });
 
-// ✅ MJPEG (stream estilo vídeo) + gating (enable/disable no agent)
+//  MJPEG (stream estilo vídeo) + gating (enable/disable no agent)
 app.get("/api/devices/:deviceId/mjpeg", authenticateAdminFlex, (req, res) => {
   const deviceId = normDeviceId(req.params.deviceId);
 
@@ -419,7 +419,7 @@ app.get("/api/devices/:deviceId/mjpeg", authenticateAdminFlex, (req, res) => {
   if (viewers === 1) {
     const agentWs = getAgentWs(deviceId);
     if (agentWs) {
-      // ✅ compat total: manda os dois
+      //  compat total: manda os dois
       sendStreamEnable(agentWs, deviceId);
     } else {
       addLog("WARN", "MJPEG viewer abriu mas agent offline", { deviceId });
@@ -477,7 +477,7 @@ app.get("/api/devices/:deviceId/mjpeg", authenticateAdminFlex, (req, res) => {
     if (left === 0) {
       const agentWs = getAgentWs(deviceId);
       if (agentWs) {
-        // ✅ compat total: manda os dois
+        //  compat total: manda os dois
         sendStreamDisable(agentWs, deviceId);
       }
     }
@@ -511,7 +511,7 @@ app.get("/api/compliance/events", authenticateAdmin, (req, res) => {
   res.json([...out].sort((a, b) => Number(b?.timestamp || 0) - Number(a?.timestamp || 0)));
 });
 
-// ✅ API 404 JSON
+//  API 404 JSON
 app.use("/api", (req, res) => {
   res.status(404).json({
     error: "API route not found",
@@ -520,7 +520,7 @@ app.use("/api", (req, res) => {
   });
 });
 
-// ✅ SPA fallback
+//  SPA fallback
 app.get(/^\/(?!api\/).*/, (_req, res) => {
   if (!fs.existsSync(ADMIN_INDEX_HTML)) {
     return res.status(404).send("Admin Console build not found");
@@ -557,7 +557,7 @@ setInterval(() => {
 wss.on("connection", (ws, req) => {
   const url = String(req.url || "");
 
-  // ✅ CORREÇÃO: parse robusto do querystring
+  // parse robusto do querystring
   const qs = url.includes("?") ? url.split("?")[1] : "";
   const params = new URLSearchParams(qs);
 
@@ -574,7 +574,7 @@ wss.on("connection", (ws, req) => {
     v: agentVersion,
   });
 
-  // ✅ CORREÇÃO: fecha conexão se role inválido
+  // fecha conexão se role inválido
   if (role !== "admin" && role !== "agent") {
     addLog("WARN", "WS role inválido - fechando", { role, ip: req.socket?.remoteAddress });
     return ws.close(1008, "invalid role");
@@ -595,7 +595,7 @@ wss.on("connection", (ws, req) => {
     }
   }
 
-  // ✅ CORREÇÃO: agent sem deviceId -> fecha
+  // agent sem deviceId -> fecha
   if (role === "agent" && !deviceId) {
     addLog("WARN", "Agent conectou sem deviceId - fechando", { ip: req.socket?.remoteAddress });
     return ws.close(1008, "missing deviceId");

@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import BackgroundEye from "./components/BackgroundEye";
 import "./app-shell.css";
 
-// ✅ Assets (adicione os arquivos conforme instrução)
+
 import imesulLogo from "./assets/imesul.png";
 import vrCreator from "./assets/vr.png";
 
@@ -30,7 +30,7 @@ function getBackendBaseFromWindow() {
       hostname.startsWith("10.") ||
       hostname.startsWith("172.");
 
-    // 🌐 PRODUÇÃO (Cloudflare / HTTPS público)
+    // PRODUÇÃO (Cloudflare / HTTPS público)
     if (isHttps && !isLocal) {
       return {
         HTTP_BASE: origin,
@@ -38,7 +38,7 @@ function getBackendBaseFromWindow() {
       };
     }
 
-    // 🖥️ LOCAL / LAN
+    // LOCAL / LAN
     const p = port && String(port).trim() ? String(port).trim() : FALLBACK_PORT;
 
     return {
@@ -134,11 +134,7 @@ function isProbablyMobile() {
   }
 }
 
-/**
- * ============================================
- * MiniModal (para "Criador")
- * ============================================
- */
+
 function Modal({ open, title, onClose, children }) {
   if (!open) return null;
 
@@ -196,7 +192,7 @@ function Modal({ open, title, onClose, children }) {
 function ScreenViewer({ deviceId, displayName, onClose }) {
   const viewerRef = useRef(null);
 
-  // ✅ modo padrão:
+  //  modo padrão:
   // - mobile -> frame (polling)
   // - desktop -> mjpeg
   const [mode, setMode] = useState(() => (isProbablyMobile() ? "frame" : "mjpeg"));
@@ -219,7 +215,7 @@ function ScreenViewer({ deviceId, displayName, onClose }) {
 
   const frameUrl = useMemo(() => {
     if (!deviceId) return "";
-    // ✅ cache-buster: t=...
+    //  cache-buster: t=...
     return (
       `${HTTP_BASE}/api/devices/${encodeURIComponent(deviceId)}/frame` +
       `?token=${encodeURIComponent(token)}` +
@@ -227,7 +223,7 @@ function ScreenViewer({ deviceId, displayName, onClose }) {
     );
   }, [deviceId, token, tick]);
 
-  // ✅ polling só no modo frame
+  //  polling só no modo frame
   useEffect(() => {
     if (!deviceId) return;
     if (mode !== "frame") return;
@@ -346,7 +342,7 @@ function ScreenViewer({ deviceId, displayName, onClose }) {
           alt="screen"
           className="viewer-img"
           onError={() => {
-            // ✅ se MJPEG falhar (muito comum em mobile), cai pro frame automaticamente
+            //  se MJPEG falhar (muito comum em mobile), cai pro frame automaticamente
             if (mode === "mjpeg") setMjpegFailed(true);
           }}
         />
@@ -459,7 +455,7 @@ function App() {
   const [activeTab, setActiveTab] = useState("devices");
   const [searchTerm, setSearchTerm] = useState("");
 
-  // ✅ Modal criador
+  //  Modal criador
   const [showCreator, setShowCreator] = useState(false);
 
   const wsRef = useRef(null);
@@ -864,7 +860,7 @@ function App() {
               LOOKOUT
             </div>
 
-            {/* ✅ NAV sem <a href="#"> pra não gerar warning */}
+            {/*  NAV sem <a href="#"> pra não gerar warning */}
             <nav className="nav">
               <button type="button" className={activeTab === "devices" ? "active" : ""} onClick={() => navigate("devices")}>
                 Dispositivos
@@ -879,7 +875,7 @@ function App() {
               </button>
             </nav>
 
-            {/* ✅ Rodapé com LOGO IMESUL + crédito do criador */}
+            {/*  Rodapé com LOGO IMESUL + crédito do criador */}
             <div className="sidebar-foot muted" style={{ marginTop: 12, fontSize: 12 }}>
               Backend: {HTTP_BASE}
 

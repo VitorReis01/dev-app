@@ -28,7 +28,7 @@ ws.on('message', async (data) => {
     if (!streaming) {
       streaming = true;
 
-      // ✅ CONFIRMA PARA O BACKEND / ADMIN
+      //  CONFIRMA PARA O BACKEND / ADMIN
       ws.send(JSON.stringify({
         type: 'view_accepted',
         deviceId
