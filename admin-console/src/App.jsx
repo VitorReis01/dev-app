@@ -2,7 +2,6 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import BackgroundEye from "./components/BackgroundEye";
 import "./app-shell.css";
 
-
 import imesulLogo from "./assets/imesul.png";
 import vrCreator from "./assets/vr.png";
 
@@ -82,6 +81,9 @@ function arrayToMapById(list) {
       lastSeen: d.lastSeen ?? null,
       agentVersion: d.agentVersion ?? null,
 
+      // tenant/loja (se o backend já enviar, aproveita)
+      tenant: d.tenant ?? d.store ?? d.loja ?? null,
+
       complianceFlag: !!d.complianceFlag,
       complianceCount: Number(d.complianceCount || 0),
       complianceLastAt: d.complianceLastAt ?? null,
@@ -106,8 +108,105 @@ function applyPresencePatch(prevById, patch) {
       online: connected,
       lastSeen: patch.lastSeen ?? prev.lastSeen ?? null,
       agentVersion: patch.agentVersion ?? prev.agentVersion ?? null,
+
+      // tenant pode vir no patch em tempo real (se existir no backend)
+      tenant: patch.tenant ?? prev.tenant ?? null,
     },
   };
+}
+
+/**
+ * ============================================
+ * JWT -> allowedTenants (lojas)
+ * ============================================
+ * O backend injeta allowedTenants no JWT.
+ * - MASTER -> ["*"]
+ * - adminCLA -> ["CLA1","CLA2"]
+ * - adminDLA1 -> ["DLA1"]
+ *
+ * O front decodifica o payload do JWT localmente (sem validar assinatura),
+ * apenas para montar a UI de seleção de loja.
+ */
+function base64UrlToUtf8(str) {
+  try {
+    const s = String(str || "").replace(/-/g, "+").replace(/_/g, "/");
+    const pad = s.length % 4 === 0 ? "" : "=".repeat(4 - (s.length % 4));
+    const bin = atob(s + pad);
+    const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return "";
+  }
+}
+
+function decodeJwtPayload(token) {
+  try {
+    const parts = String(token || "").split(".");
+    if (parts.length < 2) return null;
+    const json = base64UrlToUtf8(parts[1]);
+    if (!json) return null;
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * ============================================
+ * Tenant / Loja (UI)
+ * ============================================
+ * Regras:
+ * - Se user tem 1 tenant -> não mostra seletor
+ * - Se tem 2+ tenants -> mostra seletor (Loja 1/Loja 2)
+ * - Master -> mostra "Todas" + lista
+ *
+ * Identificação do tenant do device:
+ * 1) device.tenant (preferencial, se backend já enviar)
+ * 2) tenta inferir pelo começo do deviceId (CLA1-..., CLA2:..., etc)
+ * 3) se não der, "UNKNOWN"
+ */
+const KNOWN_TENANTS_FALLBACK = ["CLA1", "CLA2", "DLA1", "DLA2"];
+const TENANT_UNKNOWN = "UNKNOWN";
+const TENANT_ALL = "ALL";
+
+function inferTenantFromDeviceId(deviceId) {
+  const id = String(deviceId || "").trim();
+  if (!id) return null;
+
+  // tenta achar tokens no início com separadores comuns
+  const m = id.match(/^(CLA1|CLA2|DLA1|DLA2)([:\-_\.]|$)/i);
+  if (m && m[1]) return String(m[1]).toUpperCase();
+
+  // fallback: procura qualquer ocorrência (menos confiável)
+  const m2 = id.match(/\b(CLA1|CLA2|DLA1|DLA2)\b/i);
+  if (m2 && m2[1]) return String(m2[1]).toUpperCase();
+
+  return null;
+}
+
+function getDeviceTenant(device) {
+  const direct = device?.tenant ? String(device.tenant).trim() : "";
+  if (direct) return direct.toUpperCase();
+
+  const inferred = inferTenantFromDeviceId(device?.id);
+  if (inferred) return inferred;
+
+  return TENANT_UNKNOWN;
+}
+
+function tenantLabel(tenant) {
+  const t = String(tenant || "").toUpperCase();
+
+  // rótulos mínimos pedidos: CG deve ser "Loja 1 / Loja 2"
+  if (t === "CLA1") return "Loja 1";
+  if (t === "CLA2") return "Loja 2";
+
+  // para Dourados
+  if (t === "DLA1") return "Dourados 1";
+  if (t === "DLA2") return "Dourados 2";
+
+  if (t === TENANT_UNKNOWN) return "Sem loja";
+  return t || "Loja";
 }
 
 /**
@@ -133,7 +232,6 @@ function isProbablyMobile() {
     return false;
   }
 }
-
 
 function Modal({ open, title, onClose, children }) {
   if (!open) return null;
@@ -297,11 +395,7 @@ function ScreenViewer({ deviceId, displayName, onClose }) {
             Tela cheia
           </button>
 
-          <button
-            className="btn"
-            onClick={exitFullscreen}
-            title="Sai do fullscreen, mas mantém o viewer aberto"
-          >
+          <button className="btn" onClick={exitFullscreen} title="Sai do fullscreen, mas mantém o viewer aberto">
             Sair tela cheia
           </button>
 
@@ -317,11 +411,7 @@ function ScreenViewer({ deviceId, displayName, onClose }) {
             Alternar modo
           </button>
 
-          <button
-            className="btn"
-            onClick={closeViewer}
-            title="Fecha o viewer e limpa a seleção"
-          >
+          <button className="btn" onClick={closeViewer} title="Fecha o viewer e limpa a seleção">
             Fechar
           </button>
 
@@ -360,6 +450,9 @@ function LoginForm({ onLogin }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
 
+  // Controla se o campo de senha aparece como texto (visível) ou mascarado.
+  const [showPassword, setShowPassword] = useState(false);
+
   return (
     <>
       <BackgroundEye />
@@ -396,17 +489,32 @@ function LoginForm({ onLogin }) {
             >
               <div className="field">
                 <label>Usuário</label>
-                <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="admin" />
+                <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="adminCLA" />
               </div>
 
               <div className="field">
                 <label>Senha</label>
-                <input
-                  type="password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="••••••••"
-                />
+
+                {/* Linha com input + botão de mostrar/ocultar */}
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <input
+                    style={{ flex: 1 }}
+                    type={showPassword ? "text" : "password"}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="••••••••"
+                  />
+
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => setShowPassword((v) => !v)}
+                    title={showPassword ? "Ocultar senha" : "Mostrar senha"}
+                    style={{ whiteSpace: "nowrap", padding: "8px 10px" }}
+                  >
+                    {showPassword ? "🙈 Ocultar" : "👁️ Mostrar"}
+                  </button>
+                </div>
               </div>
 
               <button className="btn red full" type="submit">
@@ -455,38 +563,117 @@ function App() {
   const [activeTab, setActiveTab] = useState("devices");
   const [searchTerm, setSearchTerm] = useState("");
 
-  //  Modal criador
+  // Modal criador
   const [showCreator, setShowCreator] = useState(false);
+
+  // Tenant/Loja selecionada no UI
+  const [selectedTenant, setSelectedTenant] = useState(TENANT_ALL);
 
   const wsRef = useRef(null);
   const reconnectTimerRef = useRef(null);
   const reconnectAttemptsRef = useRef(0);
 
-  const devices = useMemo(() => {
-    const list = Object.values(devicesById).sort((a, b) => a.id.localeCompare(b.id));
+  /**
+   * ============================================
+   * allowedTenants (derivado do JWT)
+   * ============================================
+   */
+  const tokenPayload = useMemo(() => decodeJwtPayload(token), [token]);
 
+  const allowedTenants = useMemo(() => {
+    const raw = tokenPayload?.allowedTenants;
+    if (!raw) return [];
+    if (Array.isArray(raw)) return raw.map((x) => String(x).toUpperCase());
+    return [];
+  }, [tokenPayload]);
+
+  const isMaster = useMemo(() => allowedTenants.includes("*"), [allowedTenants]);
+
+  const visibleTenants = useMemo(() => {
+    // master: mostra todos conhecidos (fallback)
+    if (isMaster) return KNOWN_TENANTS_FALLBACK;
+
+    // admins comuns: o que vier no token
+    const list = allowedTenants.filter((t) => t && t !== "*");
+    return list;
+  }, [allowedTenants, isMaster]);
+
+  /**
+   * Quando o usuário/token muda:
+   * - master começa em "Todas"
+   * - admins com 1 tenant ficam fixos nele (sem seletor)
+   * - admins com 2+ tenants começam no primeiro (CG: Loja 1)
+   */
+  useEffect(() => {
+    if (!token) return;
+
+    if (isMaster) {
+      setSelectedTenant(TENANT_ALL);
+      return;
+    }
+
+    if (visibleTenants.length === 1) {
+      setSelectedTenant(visibleTenants[0]);
+      return;
+    }
+
+    if (visibleTenants.length >= 2) {
+      setSelectedTenant(visibleTenants[0]);
+      return;
+    }
+
+    setSelectedTenant(TENANT_ALL);
+  }, [token, isMaster, visibleTenants]);
+
+  /**
+   * ============================================
+   * Lista de dispositivos + busca + filtro por loja
+   * ============================================
+   */
+  const devicesAllSorted = useMemo(() => {
+    return Object.values(devicesById).sort((a, b) => a.id.localeCompare(b.id));
+  }, [devicesById]);
+
+  const devicesFiltered = useMemo(() => {
     const q = String(searchTerm || "").trim().toLowerCase();
-    if (!q) return list;
 
-    return list.filter((d) => {
+    // 1) filtra por loja selecionada
+    const byTenant = devicesAllSorted.filter((d) => {
+      const t = getDeviceTenant(d);
+
+      // Compat: se o admin só tem 1 tenant permitido e o device ainda não traz tenant,
+      // não some com tudo (deixa listar normalmente).
+      if (!isMaster && visibleTenants.length === 1) return true;
+
+      if (selectedTenant === TENANT_ALL) return true;
+
+      return t === selectedTenant;
+    });
+
+    // 2) filtra por busca (id/alias/nome)
+    if (!q) return byTenant;
+
+    return byTenant.filter((d) => {
       const id = String(d.id || "").toLowerCase();
       const alias = String((aliasesById[d.id]?.label || "")).toLowerCase();
       const name = String(d.name || "").toLowerCase();
       return id.includes(q) || alias.includes(q) || name.includes(q);
     });
-  }, [devicesById, searchTerm, aliasesById]);
+  }, [devicesAllSorted, searchTerm, aliasesById, selectedTenant, isMaster, visibleTenants]);
 
   const kpi = useMemo(() => {
     let online = 0,
       offline = 0,
       conn = 0;
-    for (const d of Object.values(devicesById)) {
+
+    // KPI calculado com base na lista filtrada (loja selecionada)
+    for (const d of devicesFiltered) {
       const o = isOnline(d);
       if (o) online += 1;
       else offline += 1;
     }
-    return { online, offline, conn, total: Object.values(devicesById).length };
-  }, [devicesById]);
+    return { online, offline, conn, total: devicesFiltered.length };
+  }, [devicesFiltered]);
 
   const getAliasLabel = (deviceId) => {
     const id = normId(deviceId);
@@ -544,6 +731,7 @@ function App() {
     setAliasesById({});
     setActiveTab("devices");
     setSearchTerm("");
+    setSelectedTenant(TENANT_ALL);
 
     localStorage.removeItem("lookout_token");
     localStorage.removeItem("lookout_user");
@@ -860,7 +1048,7 @@ function App() {
               LOOKOUT
             </div>
 
-            {/*  NAV sem <a href="#"> pra não gerar warning */}
+            {/* NAV sem <a href="#"> pra não gerar warning */}
             <nav className="nav">
               <button type="button" className={activeTab === "devices" ? "active" : ""} onClick={() => navigate("devices")}>
                 Dispositivos
@@ -875,7 +1063,7 @@ function App() {
               </button>
             </nav>
 
-            {/*  Rodapé com LOGO IMESUL + crédito do criador */}
+            {/* Rodapé com LOGO IMESUL + crédito do criador */}
             <div className="sidebar-foot muted" style={{ marginTop: 12, fontSize: 12 }}>
               Backend: {HTTP_BASE}
 
@@ -946,7 +1134,66 @@ function App() {
                     <p className="sub">Gerencie computadores conectados e solicite suporte remoto.</p>
                   </div>
 
-                  <div className="row" style={{ gap: 8 }}>
+                  <div className="row" style={{ gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                    {/* Seletor de Loja (tenant) */}
+                    {visibleTenants.length >= 2 || isMaster ? (
+                      <div
+                        className="row"
+                        style={{
+                          gap: 8,
+                          alignItems: "center",
+                          padding: "6px 10px",
+                          borderRadius: 12,
+                          border: "1px solid rgba(255,255,255,.08)",
+                          background: "rgba(255,255,255,.03)",
+                        }}
+                        title="Filtra os dispositivos pela loja (tenant)"
+                      >
+                        <span className="muted" style={{ fontSize: 12 }}>
+                          Loja:
+                        </span>
+
+                        {isMaster ? (
+                          <>
+                            <button
+                              type="button"
+                              className={`btn ${selectedTenant === TENANT_ALL ? "red" : ""}`}
+                              onClick={() => setSelectedTenant(TENANT_ALL)}
+                              style={{ padding: "6px 10px" }}
+                            >
+                              Todas
+                            </button>
+
+                            {KNOWN_TENANTS_FALLBACK.map((t) => (
+                              <button
+                                key={t}
+                                type="button"
+                                className={`btn ${selectedTenant === t ? "red" : ""}`}
+                                onClick={() => setSelectedTenant(t)}
+                                style={{ padding: "6px 10px" }}
+                                title={t}
+                              >
+                                {tenantLabel(t)}
+                              </button>
+                            ))}
+                          </>
+                        ) : (
+                          visibleTenants.map((t) => (
+                            <button
+                              key={t}
+                              type="button"
+                              className={`btn ${selectedTenant === t ? "red" : ""}`}
+                              onClick={() => setSelectedTenant(t)}
+                              style={{ padding: "6px 10px" }}
+                              title={t}
+                            >
+                              {tenantLabel(t)}
+                            </button>
+                          ))
+                        )}
+                      </div>
+                    ) : null}
+
                     <button
                       type="button"
                       className={`btn ${showCompliance ? "red" : ""}`}
@@ -992,7 +1239,14 @@ function App() {
                 <section className="panel">
                   <div className="panel-head">
                     <div>
-                      <div className="panel-title">Lista de dispositivos</div>
+                      <div className="panel-title">
+                        Lista de dispositivos{" "}
+                        {(visibleTenants.length >= 2 || isMaster) && selectedTenant !== TENANT_ALL ? (
+                          <span className="muted" style={{ fontSize: 12, marginLeft: 10 }}>
+                            ({tenantLabel(selectedTenant)})
+                          </span>
+                        ) : null}
+                      </div>
                       <div className="muted" style={{ fontSize: 12 }}>
                         Clique em “Suporte” para solicitar acesso e “Ver tela” após autorização.
                       </div>
@@ -1012,7 +1266,7 @@ function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {devices.map((d) => {
+                      {devicesFiltered.map((d) => {
                         const online = isOnline(d);
                         const displayName = getDisplayName(d);
                         const deviceId = d.id;
@@ -1089,7 +1343,7 @@ function App() {
                           </tr>
                         );
                       })}
-                      {devices.length === 0 && (
+                      {devicesFiltered.length === 0 && (
                         <tr>
                           <td colSpan={7} className="muted" style={{ padding: 16 }}>
                             Nenhum dispositivo encontrado.

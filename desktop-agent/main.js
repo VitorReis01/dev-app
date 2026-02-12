@@ -4,6 +4,7 @@
  * Lookout Desktop Agent – PRODUÇÃO
  *
  * ✔ DeviceId automático (UUID persistido)  [GLOBAL POR MÁQUINA quando possível]
+ * ✔ Tenant (Loja) persistido e enviado no WS (CLA1/CLA2/DLA1/DLA2)
  * ✔ Zero input do usuário
  * ✔ Multi-PC garantido
  * ✔ WebSocket com heartbeat
@@ -30,9 +31,33 @@ const crypto = require("crypto");
 // ============================
 // CONFIG FIXA
 // ============================
+// BACKEND_HOST pode ser IP interno do servidor
+// BACKEND_PORT porta do backend (Express + WS)
 const BACKEND_HOST = "192.168.1.101";
 const BACKEND_PORT = 3001;
 const AGENT_VERSION = "1.0.5";
+
+// ============================
+// TENANT (LOJA)
+// ============================
+// Define qual loja este agent pertence.
+// Ordem de resolução:
+// 1) env LOOKOUT_TENANT (ideal para gerar instaladores diferentes por loja)
+// 2) agent-config.json (persistido na máquina)
+// 3) fallback (CLA1)
+const VALID_TENANTS = new Set(["CLA1", "CLA2", "DLA1", "DLA2"]);
+const DEFAULT_TENANT = "CLA1";
+
+function normTenant(t) {
+  return String(t || "").trim().toUpperCase();
+}
+
+function resolveTenant(candidate) {
+  const v = normTenant(candidate);
+  if (!v) return DEFAULT_TENANT;
+  if (!VALID_TENANTS.has(v)) return DEFAULT_TENANT;
+  return v;
+}
 
 // ============================
 // STORAGE GLOBAL (POR MÁQUINA) - CROSS PLATFORM
@@ -118,7 +143,7 @@ function processExists(pid) {
   }
 }
 
-function tryAcquireGlobalLock() {
+function tryAcquireGlobalLock(ownerExtra) {
   if (fs.existsSync(LOCK_PATH)) {
     try {
       const raw = fs.readFileSync(LOCK_PATH, "utf8");
@@ -150,6 +175,7 @@ function tryAcquireGlobalLock() {
       session: process.env.SESSIONNAME || null,
       username: process.env.USERNAME || null,
       user: process.env.USER || null,
+      ...(ownerExtra || {}),
     };
     fs.writeFileSync(fd, JSON.stringify(owner, null, 2));
     fs.closeSync(fd);
@@ -176,33 +202,61 @@ function releaseGlobalLock() {
 }
 
 // ============================
-// DEVICE ID PERSISTENTE
+// CONFIG PERSISTENTE (deviceId + tenant)
 // ============================
-function getOrCreateDeviceId() {
+// Mantém um JSON em disco para:
+// - deviceId único por máquina
+// - tenant (loja) fixo para aquele agente
+function readConfigSafe() {
   try {
-    if (fs.existsSync(CONFIG_PATH)) {
-      const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
-      if (cfg.deviceId) return cfg.deviceId;
-    }
-  } catch { }
+    if (!fs.existsSync(CONFIG_PATH)) return null;
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+    return cfg && typeof cfg === "object" ? cfg : null;
+  } catch {
+    return null;
+  }
+}
 
-  const deviceId = "device-" + crypto.randomUUID();
+function writeConfigSafe(cfg) {
+  try {
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getOrCreateAgentIdentity() {
+  const existing = readConfigSafe();
+
+  // deviceId: preserva se já existe; se não existe, cria.
+  const deviceIdFromDisk = String(existing?.deviceId || "").trim();
+  const deviceId = deviceIdFromDisk || "device-" + crypto.randomUUID();
+
+  // tenant: prioridade env -> disco -> default
+  const tenantFromEnv = resolveTenant(process.env.LOOKOUT_TENANT);
+  const tenantFromDisk = resolveTenant(existing?.tenant);
+  const tenant = tenantFromEnv || tenantFromDisk || DEFAULT_TENANT;
+
   const cfg = {
+    ...(existing || {}),
     deviceId,
-    createdAt: new Date().toISOString(),
+    tenant,
+    updatedAt: new Date().toISOString(),
+    createdAt: existing?.createdAt || new Date().toISOString(),
     version: AGENT_VERSION,
     platform: process.platform,
     baseDir: BASE_DIR,
   };
 
-  try {
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
-  } catch { }
+  writeConfigSafe(cfg);
 
-  return deviceId;
+  return { deviceId, tenant };
 }
 
-const DEVICE_ID = getOrCreateDeviceId();
+const IDENTITY = getOrCreateAgentIdentity();
+const DEVICE_ID = IDENTITY.deviceId;
+const TENANT = IDENTITY.tenant;
 
 // ============================
 // UI (bonita - loadFile + frame custom)
@@ -224,13 +278,14 @@ function createWindow() {
     },
   });
 
-  //  carrega o HTML real (assim a imagem eye-cyber.png funciona)
+  // carrega o HTML real (assim a imagem eye-cyber.png funciona)
   mainWindow.loadFile(path.join(__dirname, "index.html"));
 
-  //  injeta valores iniciais no DOM
+  // injeta valores iniciais no DOM
   mainWindow.webContents.on("did-finish-load", () => {
     setText("deviceId", DEVICE_ID);
     setText("version", AGENT_VERSION);
+    setText("tenant", TENANT); // se não existir no HTML, não causa erro
     setText("statusLabel", "CONECTADO");
     setStatus("Conectado ✅");
   });
@@ -257,7 +312,7 @@ function setMini(id, value) {
   setText(id, value);
 }
 
-//  IPC dos botões da titlebar custom (preload chama isso)
+// IPC dos botões da titlebar custom (preload chama isso)
 ipcMain.on("window:minimize", () => {
   try {
     mainWindow?.minimize();
@@ -279,9 +334,10 @@ let heartbeat = null;
 let reconnectTimer = null;
 
 function wsUrl() {
+  // Inclui tenant para o backend isolar corretamente as lojas.
   return `ws://${BACKEND_HOST}:${BACKEND_PORT}/?role=agent&deviceId=${encodeURIComponent(
     DEVICE_ID
-  )}&v=${AGENT_VERSION}&token=agent`;
+  )}&tenant=${encodeURIComponent(TENANT)}&v=${AGENT_VERSION}&token=agent`;
 }
 
 function startHeartbeat() {
@@ -306,14 +362,14 @@ function scheduleReconnect() {
 // ============================
 // CONSENT + STREAM STATE (sessão)
 // ============================
-let consentGranted = false; //  aceitou nessa sessão
-let viewerActive = false; //  backend disse stream-enable
+let consentGranted = false; // aceitou nessa sessão
+let viewerActive = false; // backend disse stream-enable
 let streaming = false;
 
-//  PATCH: evita abrir múltiplos prompts de consent ao mesmo tempo
+// evita abrir múltiplos prompts de consent ao mesmo tempo
 let consentPromptOpen = false;
 
-//  PATCH: consent automático quando viewer abre (mesmo sem request_remote_access)
+// consent automático quando viewer abre (mesmo sem request_remote_access)
 async function ensureConsentForViewer() {
   if (consentGranted) return true;
   if (consentPromptOpen) return false;
@@ -362,13 +418,13 @@ function connectWs() {
 
   ws.on("open", () => {
     startHeartbeat();
-    mainWindow?.setTitle("Lookout Agent - conectado");
+    mainWindow?.setTitle(`Lookout Agent - conectado (${TENANT})`);
     setStatus("Conectado ✅");
   });
 
-  //  PATCH: ws.on("message") pode receber (data, isBinary)
+  // ws.on("message") pode receber (data, isBinary)
   ws.on("message", async (raw, isBinary) => {
-    // se algum dia chegar binário do backend, ignore (nosso protocolo é JSON do backend → agent)
+    // se algum dia chegar binário do backend, ignore (protocolo do backend → agent é JSON)
     if (isBinary) return;
 
     let msg;
@@ -380,19 +436,19 @@ function connectWs() {
 
     if (msg.type === "pong") return;
 
-    //  PATCH: aceitar variações com underscore também
+    // aceita variações com underscore também
     const t = String(msg.type || "");
 
     const isStreamEnable = t === "stream-enable" || t === "stream_enable";
     const isStreamDisable = t === "stream-disable" || t === "stream_disable";
 
-    //  backend abriu viewer (MJPEG)
+    // backend abriu viewer (MJPEG)
     if (isStreamEnable) {
       viewerActive = true;
       setMini("viewer", "ABERTO");
       setStatus(`Viewer abriu (${t}) ✅`);
 
-      //  PATCH: se não tem consent ainda, pede automaticamente (1x na sessão)
+      // se não tem consent ainda, pede automaticamente (1x na sessão)
       if (!consentGranted) {
         const ok = await ensureConsentForViewer();
         if (!ok) return;
@@ -402,7 +458,7 @@ function connectWs() {
       return;
     }
 
-    //  backend fechou viewer (MJPEG)
+    // backend fechou viewer (MJPEG)
     if (isStreamDisable) {
       viewerActive = false;
       setMini("viewer", "nenhum");
@@ -410,15 +466,15 @@ function connectWs() {
 
       stopStreaming();
 
-      //  regra pedida: se site/viewer fechou, pede consent de novo na próxima vez
+      // se site/viewer fechou, pede consent de novo na próxima vez
       consentGranted = false;
       setMini("consent", "NÃO");
       return;
     }
 
-    //  pedido de consentimento (Suporte)
+    // pedido de consentimento (Suporte)
     if (msg.type === "consent_request") {
-      // Se já aceitou nessa sessão, não pergunta de novo
+      // se já aceitou nessa sessão, não pergunta de novo
       if (consentGranted) {
         try {
           ws.send(JSON.stringify({ type: "consent_response", accepted: true }));
@@ -468,7 +524,7 @@ function connectWs() {
     mainWindow?.setTitle("Lookout Agent - desconectado");
     setStatus("Desconectado. Reconectando...");
 
-    //  ao cair conexão, reseta sessão
+    // ao cair conexão, reseta sessão
     consentGranted = false;
     viewerActive = false;
     consentPromptOpen = false;
@@ -502,7 +558,7 @@ async function captureJpegBuffer() {
 
   if (!sources.length) return null;
 
-  //  Buffer JPEG direto (sem base64)
+  // Buffer JPEG direto (sem base64)
   const img = sources[0].thumbnail;
   const buf = img.toJPEG(JPEG_QUALITY);
   return buf && buf.length ? buf : null;
@@ -518,7 +574,7 @@ async function sendFrameBinary() {
     const buf = await captureJpegBuffer();
     if (!buf) return;
 
-    //  envia binário direto
+    // envia binário direto
     ws.send(buf, { binary: true });
   } catch { }
 }
@@ -555,7 +611,8 @@ if (!gotSingleInstance) {
 }
 
 app.whenReady().then(async () => {
-  const lock = tryAcquireGlobalLock();
+  // O lock grava tenant também, útil para diagnóstico quando alguém duplicar processo.
+  const lock = tryAcquireGlobalLock({ tenant: TENANT, deviceId: DEVICE_ID });
   if (!lock.ok) {
     try {
       app.quit();

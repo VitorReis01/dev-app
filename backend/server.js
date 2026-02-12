@@ -20,6 +20,8 @@ app.set("etag", false);
 // ============================
 // LOGS (memória - ring buffer)
 // ============================
+// Mantém um histórico curto de logs em memória para diagnóstico no Admin Console
+// e também espelha no console (útil no NSSM/serviço).
 const MAX_LOGS = 500;
 const logs = []; // { ts, level, msg, meta }
 
@@ -33,18 +35,18 @@ function addLog(level, msg, meta) {
   logs.push(entry);
   if (logs.length > MAX_LOGS) logs.shift();
 
-  // também vai pro console (ajuda no NSSM/serviço)
   try {
     console.log(
       `[${new Date(entry.ts).toISOString()}] ${entry.level}: ${entry.msg}`,
       entry.meta ?? ""
     );
-  } catch {}
+  } catch { }
 }
 
 // ============================
 // API GUARD: /api nunca pode cair no SPA fallback
 // ============================
+// Evita que requests para /api/* sejam respondidos com index.html do React.
 app.use("/api", (req, res, next) => {
   res.setHeader("Cache-Control", "no-store");
   next();
@@ -53,6 +55,7 @@ app.use("/api", (req, res, next) => {
 // ============================
 // HTTP LOG (somente /api)
 // ============================
+// Loga chamadas REST para rastrear o que está sendo acessado.
 app.use((req, _res, next) => {
   if (req.path && String(req.path).startsWith("/api/")) {
     addLog("INFO", `HTTP ${req.method} ${req.path}`, { ip: req.ip });
@@ -60,10 +63,62 @@ app.use((req, _res, next) => {
   next();
 });
 
-// Mantém compatível com seu setup atual,
+// Mantém compatível com setup atual,
 // mas permite trocar sem refatorar depois (via variável de ambiente).
 const JWT_SECRET = process.env.JWT_SECRET || "supersecretkey";
 const PORT = Number(process.env.PORT || 3001);
+
+// ============================
+// MULTI-LOJA (TENANTS)
+// ============================
+// "Tenant" aqui significa a "loja/unidade" (ex: CLA1, CLA2, DLA1, DLA2).
+// O isolamento é feito por tenant: admins só enxergam devices do(s) tenant(s)
+// permitido(s) no token JWT.
+const VALID_TENANTS = new Set(["CLA1", "CLA2", "DLA1", "DLA2"]);
+
+// Compatibilidade com agents antigos: se o agent não enviar tenant,
+// o servidor atribui este tenant padrão.
+const DEFAULT_TENANT = String(process.env.LOOKOUT_DEFAULT_TENANT || "CLA1").trim().toUpperCase();
+
+function normTenant(t) {
+  const v = String(t || "").trim().toUpperCase();
+  return v;
+}
+
+function isValidTenant(t) {
+  const v = normTenant(t);
+  return VALID_TENANTS.has(v);
+}
+
+function resolveTenantFromAgentQuery(params) {
+  const q = normTenant(params.get("tenant"));
+  if (q && isValidTenant(q)) return q;
+
+  // Se veio vazio, assume DEFAULT_TENANT para não quebrar agentes atuais.
+  // Se veio inválido (string qualquer), considera inválido e rejeita.
+  if (!q) {
+    if (!isValidTenant(DEFAULT_TENANT)) return null;
+    return DEFAULT_TENANT;
+  }
+  return null;
+}
+
+function resolveTenantFromAdminJwt(decoded) {
+  // decoded.allowedTenants pode ser ["*"] (master) ou lista de tenants.
+  const raw = decoded?.allowedTenants;
+  if (Array.isArray(raw) && raw.length) return raw;
+  return [];
+}
+
+function isMasterAllowed(allowedTenants) {
+  return Array.isArray(allowedTenants) && allowedTenants.includes("*");
+}
+
+function adminCanAccessTenant(allowedTenants, tenant) {
+  if (isMasterAllowed(allowedTenants)) return true;
+  const t = normTenant(tenant);
+  return Array.isArray(allowedTenants) && allowedTenants.includes(t);
+}
 
 // ============================
 // Persistência (data dir)
@@ -73,12 +128,14 @@ const DATA_DIR = path.join(__dirname, "data");
 // ============================
 // Persistência (aliases)
 // ============================
+// Armazena apelidos/labels para deviceId.
+// Mantém arquivo único (não separa por tenant ainda), mas filtra na leitura.
 const ALIASES_PATH = path.join(DATA_DIR, "device-aliases.json");
 
 function ensureDataDir() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-  } catch {}
+  } catch { }
 }
 
 function loadJsonSafe(filePath, fallback) {
@@ -107,6 +164,8 @@ let deviceAliases = loadJsonSafe(ALIASES_PATH, {});
 // ============================
 // Compliance persistence
 // ============================
+// Mantém eventos de compliance em arquivo único, e agrega por device em memória.
+// Na leitura via API, filtra por tenant permitido (via deviceId -> tenant).
 const COMPLIANCE_EVENTS_PATH = path.join(DATA_DIR, "compliance-events.json");
 let complianceEvents = loadJsonSafe(COMPLIANCE_EVENTS_PATH, []);
 if (!Array.isArray(complianceEvents)) complianceEvents = [];
@@ -157,18 +216,42 @@ function getComplianceState(deviceId) {
 // ============================
 // Admin users (seed)
 // ============================
+// Define usuários e quais tenants (lojas) cada um pode enxergar.
+// allowedTenants:
+//   - ["*"] => master (acesso total)
+//   - ["CLA1","CLA2"] => acesso limitado às lojas listadas
 const adminsSeed = [
   {
     id: 1,
-    username: "admin",
+    username: "lookout.master",
+    passwordHash: bcrypt.hashSync("R7!Lookout$Master#CLA_DLA26", 10),
+    allowedTenants: ["*"],
+  },
+  {
+    id: 2,
+    username: "adminCLA",
     passwordHash: bcrypt.hashSync("@ims1234!", 10),
+    allowedTenants: ["CLA1", "CLA2"],
+  },
+  {
+    id: 3,
+    username: "adminDLA1",
+    passwordHash: bcrypt.hashSync("@ims1234!", 10),
+    allowedTenants: ["DLA1"],
+  },
+  {
+    id: 4,
+    username: "adminDLA2",
+    passwordHash: bcrypt.hashSync("@ims1234!", 10),
+    allowedTenants: ["DLA2"],
   },
 ];
 
 // ============================
 // In-memory
 // ============================
-const devices = []; // { id, connected, lastSeen, agentVersion }
+// devices agora possuem tenant (loja) para permitir isolamento.
+const devices = []; // { id, tenant, connected, lastSeen, agentVersion }
 const wsAgentsByDeviceId = new Map();
 
 //  pode guardar:
@@ -201,12 +284,27 @@ function findDevice(id) {
   return devices.find((d) => d.id === norm);
 }
 
-function upsertDevice(id) {
+function upsertDevice(id, tenantIfKnown) {
   const deviceId = normDeviceId(id);
   let d = findDevice(deviceId);
   if (!d) {
-    d = { id: deviceId, connected: false, lastSeen: null, agentVersion: null };
+    d = {
+      id: deviceId,
+      tenant: tenantIfKnown && isValidTenant(tenantIfKnown) ? normTenant(tenantIfKnown) : DEFAULT_TENANT,
+      connected: false,
+      lastSeen: null,
+      agentVersion: null,
+    };
     devices.push(d);
+  } else {
+    // Atualiza tenant se vier informação explícita válida (ex: agent começou a enviar).
+    if (tenantIfKnown && isValidTenant(tenantIfKnown)) {
+      d.tenant = normTenant(tenantIfKnown);
+    }
+    // Se ainda não tem tenant válido, garante o padrão para consistência.
+    if (!isValidTenant(d.tenant)) {
+      d.tenant = isValidTenant(DEFAULT_TENANT) ? DEFAULT_TENANT : "CLA1";
+    }
   }
   return d;
 }
@@ -217,14 +315,6 @@ function safeSend(ws, obj) {
     return true;
   }
   return false;
-}
-
-function broadcastToAdmins(obj) {
-  wss.clients.forEach((c) => {
-    if (c.isAdmin && c.readyState === WebSocket.OPEN) {
-      c.send(JSON.stringify(obj));
-    }
-  });
 }
 
 function stripDataUrlToBase64(maybeDataUrl) {
@@ -245,6 +335,47 @@ function getAgentWs(deviceId) {
   return null;
 }
 
+function getDeviceTenant(deviceId) {
+  const d = findDevice(deviceId);
+  return d?.tenant ? normTenant(d.tenant) : null;
+}
+
+function adminCanAccessDevice(allowedTenants, deviceId) {
+  const t = getDeviceTenant(deviceId);
+  if (!t) return false;
+  return adminCanAccessTenant(allowedTenants, t);
+}
+
+function filterDevicesForAdmin(allowedTenants) {
+  if (isMasterAllowed(allowedTenants)) return devices;
+  return devices.filter((d) => adminCanAccessTenant(allowedTenants, d.tenant));
+}
+
+function filterAliasesForAdmin(allowedTenants) {
+  if (isMasterAllowed(allowedTenants)) return deviceAliases;
+
+  const out = {};
+  for (const [deviceId, val] of Object.entries(deviceAliases || {})) {
+    if (adminCanAccessDevice(allowedTenants, deviceId)) out[deviceId] = val;
+  }
+  return out;
+}
+
+function filterComplianceEventsForAdmin(allowedTenants, filterDeviceIdOptional) {
+  const filterId = String(filterDeviceIdOptional || "").trim();
+
+  const base = filterId
+    ? complianceEvents.filter((e) => String(e?.deviceId || "").trim() === filterId)
+    : complianceEvents;
+
+  if (isMasterAllowed(allowedTenants)) return base;
+
+  return base.filter((e) => adminCanAccessDevice(allowedTenants, String(e?.deviceId || "").trim()));
+}
+
+// ============================
+// MJPEG viewers gating
+// ============================
 function incMjpegViewer(deviceId) {
   const id = normDeviceId(deviceId);
   const n = Number(mjpegViewersByDevice[id] || 0) + 1;
@@ -275,6 +406,37 @@ function sendStreamDisable(agentWs, deviceId) {
 }
 
 // ============================
+// Broadcasts com isolamento por tenant
+// ============================
+// Envia eventos apenas para admins que têm permissão de ver o tenant do device.
+function broadcastToAdminsFiltered(obj, tenant) {
+  const t = normTenant(tenant);
+  wss.clients.forEach((c) => {
+    if (!c.isAdmin) return;
+    if (c.readyState !== WebSocket.OPEN) return;
+
+    const allowed = c.allowedTenants || [];
+    if (!adminCanAccessTenant(allowed, t)) return;
+
+    try {
+      c.send(JSON.stringify(obj));
+    } catch { }
+  });
+}
+
+function broadcastPresence(deviceId, payload) {
+  const t = getDeviceTenant(deviceId);
+  if (!t) return;
+  broadcastToAdminsFiltered(payload, t);
+}
+
+function sendSnapshotToAdmin(ws) {
+  const allowed = ws.allowedTenants || [];
+  const filtered = filterDevicesForAdmin(allowed).map((d) => ({ ...d }));
+  safeSend(ws, { type: "devices_snapshot", devices: filtered });
+}
+
+// ============================
 //  ADMIN CONSOLE (React build) (ANTES do fallback)
 // ============================
 const ADMIN_BUILD_DIR = path.join(__dirname, "..", "admin-console", "build");
@@ -297,6 +459,7 @@ app.get("/api/health", (_req, res) => {
 // ============================
 // Auth
 // ============================
+// Login valida senha e emite JWT contendo allowedTenants do usuário.
 app.post("/api/login", (req, res) => {
   const { username, password } = req.body || {};
   const admin = adminsSeed.find((a) => a.username === username);
@@ -306,12 +469,26 @@ app.post("/api/login", (req, res) => {
     return res.status(401).json({ error: "Credenciais inválidas" });
   }
 
-  const token = jwt.sign({ id: admin.id, username: admin.username }, JWT_SECRET, {
-    expiresIn: "1h",
-  });
+  const token = jwt.sign(
+    {
+      id: admin.id,
+      username: admin.username,
+      allowedTenants: Array.isArray(admin.allowedTenants) ? admin.allowedTenants : [],
+    },
+    JWT_SECRET,
+    { expiresIn: "1h" }
+  );
 
-  addLog("INFO", "Login OK", { username: admin.username });
-  res.json({ token, user: { id: admin.id, username: admin.username } });
+  addLog("INFO", "Login OK", { username: admin.username, allowedTenants: admin.allowedTenants });
+
+  res.json({
+    token,
+    user: {
+      id: admin.id,
+      username: admin.username,
+      allowedTenants: admin.allowedTenants,
+    },
+  });
 });
 
 function authenticateAdmin(req, res, next) {
@@ -319,7 +496,9 @@ function authenticateAdmin(req, res, next) {
   if (!auth) return res.status(401).json({ error: "Token necessário" });
 
   try {
-    req.admin = jwt.verify(auth.replace("Bearer ", ""), JWT_SECRET);
+    const decoded = jwt.verify(auth.replace("Bearer ", ""), JWT_SECRET);
+    decoded.allowedTenants = resolveTenantFromAdminJwt(decoded);
+    req.admin = decoded;
     next();
   } catch {
     return res.status(401).json({ error: "Token inválido" });
@@ -341,7 +520,9 @@ function authenticateAdminFlex(req, res, next) {
   if (!token) return res.status(401).json({ error: "Token necessário" });
 
   try {
-    req.admin = jwt.verify(token, JWT_SECRET);
+    const decoded = jwt.verify(token, JWT_SECRET);
+    decoded.allowedTenants = resolveTenantFromAdminJwt(decoded);
+    req.admin = decoded;
     next();
   } catch {
     return res.status(401).json({ error: "Token inválido" });
@@ -351,14 +532,20 @@ function authenticateAdminFlex(req, res, next) {
 // ============================
 // REST
 // ============================
-app.get("/api/devices", authenticateAdmin, (_req, res) => {
-  const out = devices.map((d) => {
+
+// Lista devices filtrados por tenant permitido no JWT.
+app.get("/api/devices", authenticateAdmin, (req, res) => {
+  const allowedTenants = req.admin?.allowedTenants || [];
+  const list = filterDevicesForAdmin(allowedTenants);
+
+  const out = list.map((d) => {
     const comp = getComplianceState(d.id);
     const connected = !!d.connected;
     return {
       id: d.id,
       deviceId: d.id,
       name: d.id,
+      tenant: d.tenant, // ajuda UI/diagnóstico
       connected,
       online: connected,
       lastSeen: d.lastSeen,
@@ -366,6 +553,7 @@ app.get("/api/devices", authenticateAdmin, (_req, res) => {
       ...comp,
     };
   });
+
   res.json(out);
 });
 
@@ -374,11 +562,17 @@ app.get("/api/logs", authenticateAdmin, (_req, res) => {
   res.json(logs);
 });
 
-//  rota única do frame (1 imagem JPEG)
+// Rota única do frame (1 imagem JPEG) com isolamento por tenant.
 app.get("/api/devices/:deviceId/frame", authenticateAdminFlex, (req, res) => {
   const deviceId = normDeviceId(req.params.deviceId);
-  const frameRaw = lastFrameByDevice[deviceId];
 
+  const allowedTenants = req.admin?.allowedTenants || [];
+  if (!adminCanAccessDevice(allowedTenants, deviceId)) {
+    addLog("WARN", "frame denied (tenant isolation)", { user: req.admin?.username, deviceId });
+    return res.status(403).send("Forbidden");
+  }
+
+  const frameRaw = lastFrameByDevice[deviceId];
   if (!frameRaw) return res.status(404).send("No frame");
 
   if (isBufferLike(frameRaw)) {
@@ -403,11 +597,16 @@ app.get("/api/devices/:deviceId/frame", authenticateAdminFlex, (req, res) => {
   }
 });
 
-//  MJPEG (stream estilo vídeo) + gating (enable/disable no agent)
+// MJPEG (stream estilo vídeo) + gating (enable/disable no agent) com isolamento por tenant.
 app.get("/api/devices/:deviceId/mjpeg", authenticateAdminFlex, (req, res) => {
   const deviceId = normDeviceId(req.params.deviceId);
 
-  // LOG ÚTIL (pra provar que o request chegou no Node)
+  const allowedTenants = req.admin?.allowedTenants || [];
+  if (!adminCanAccessDevice(allowedTenants, deviceId)) {
+    addLog("WARN", "mjpeg denied (tenant isolation)", { user: req.admin?.username, deviceId });
+    return res.status(403).send("Forbidden");
+  }
+
   addLog("INFO", "MJPEG endpoint hit", {
     deviceId,
     hasToken: !!String(req.query?.token || ""),
@@ -419,7 +618,6 @@ app.get("/api/devices/:deviceId/mjpeg", authenticateAdminFlex, (req, res) => {
   if (viewers === 1) {
     const agentWs = getAgentWs(deviceId);
     if (agentWs) {
-      //  compat total: manda os dois
       sendStreamEnable(agentWs, deviceId);
     } else {
       addLog("WARN", "MJPEG viewer abriu mas agent offline", { deviceId });
@@ -470,23 +668,23 @@ app.get("/api/devices/:deviceId/mjpeg", authenticateAdminFlex, (req, res) => {
     clearInterval(timer);
     try {
       res.end();
-    } catch {}
+    } catch { }
 
     const left = decMjpegViewer(deviceId);
 
     if (left === 0) {
       const agentWs = getAgentWs(deviceId);
       if (agentWs) {
-        //  compat total: manda os dois
         sendStreamDisable(agentWs, deviceId);
       }
     }
   });
 });
 
-// aliases
-app.get("/api/device-aliases", authenticateAdmin, (_req, res) => {
-  res.json(deviceAliases);
+// aliases (filtrados por tenant permitido)
+app.get("/api/device-aliases", authenticateAdmin, (req, res) => {
+  const allowedTenants = req.admin?.allowedTenants || [];
+  res.json(filterAliasesForAdmin(allowedTenants));
 });
 
 app.put("/api/device-aliases/:deviceId", authenticateAdmin, (req, res) => {
@@ -495,23 +693,29 @@ app.put("/api/device-aliases/:deviceId", authenticateAdmin, (req, res) => {
 
   if (!id) return res.status(400).json({ error: "deviceId inválido" });
 
+  const allowedTenants = req.admin?.allowedTenants || [];
+  if (!adminCanAccessDevice(allowedTenants, id)) {
+    addLog("WARN", "alias update denied (tenant isolation)", { user: req.admin?.username, deviceId: id });
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
   deviceAliases[id] = { label, updatedAt: new Date().toISOString() };
   saveJsonSafe(ALIASES_PATH, deviceAliases);
 
   res.json({ ok: true, deviceId: id, ...deviceAliases[id] });
 });
 
-// compliance events
+// compliance events (filtrados por tenant permitido)
 app.get("/api/compliance/events", authenticateAdmin, (req, res) => {
+  const allowedTenants = req.admin?.allowedTenants || [];
   const filterId = String(req.query?.deviceId || "").trim();
-  const out = filterId
-    ? complianceEvents.filter((e) => String(e?.deviceId || "").trim() === filterId)
-    : complianceEvents;
+
+  const out = filterComplianceEventsForAdmin(allowedTenants, filterId);
 
   res.json([...out].sort((a, b) => Number(b?.timestamp || 0) - Number(a?.timestamp || 0)));
 });
 
-//  API 404 JSON
+// API 404 JSON
 app.use("/api", (req, res) => {
   res.status(404).json({
     error: "API route not found",
@@ -520,7 +724,7 @@ app.use("/api", (req, res) => {
   });
 });
 
-//  SPA fallback
+// SPA fallback
 app.get(/^\/(?!api\/).*/, (_req, res) => {
   if (!fs.existsSync(ADMIN_INDEX_HTML)) {
     return res.status(404).send("Admin Console build not found");
@@ -531,6 +735,8 @@ app.get(/^\/(?!api\/).*/, (_req, res) => {
 // ============================
 // Presence TTL cleanup
 // ============================
+// Marca offline quando não recebe ping/frame há tempo suficiente.
+// O broadcast respeita tenant (somente admins autorizados recebem).
 setInterval(() => {
   const t = nowMs();
   for (const d of devices) {
@@ -539,13 +745,14 @@ setInterval(() => {
     if (last && t - last > PRESENCE_TTL_MS) {
       d.connected = false;
 
-      addLog("WARN", "Presence TTL: marcando device offline", { deviceId: d.id });
+      addLog("WARN", "Presence TTL: marcando device offline", { deviceId: d.id, tenant: d.tenant });
 
-      broadcastToAdmins({
+      broadcastPresence(d.id, {
         type: "device_presence",
         deviceId: d.id,
         online: false,
         lastSeen: t,
+        agentVersion: d.agentVersion ?? null,
       });
     }
   }
@@ -554,6 +761,9 @@ setInterval(() => {
 // ============================
 // WebSocket
 // ============================
+// Conexões:
+// - Admin: ws://host/?role=admin&token=JWT
+// - Agent: ws://host/?role=agent&deviceId=...&tenant=CLA1&v=...&token=agent
 wss.on("connection", (ws, req) => {
   const url = String(req.url || "");
 
@@ -583,12 +793,16 @@ wss.on("connection", (ws, req) => {
   if (role === "admin") {
     try {
       const decoded = jwt.verify(token, JWT_SECRET);
+      const allowedTenants = resolveTenantFromAdminJwt(decoded);
+
       ws.isAdmin = true;
       ws.adminUser = decoded.username;
+      ws.allowedTenants = allowedTenants;
 
-      addLog("INFO", "Admin conectado", { username: decoded.username });
+      addLog("INFO", "Admin conectado", { username: decoded.username, allowedTenants });
 
-      safeSend(ws, { type: "devices_snapshot", devices: devices.map((d) => ({ ...d })) });
+      // Envia snapshot filtrado do que este admin pode ver.
+      sendSnapshotToAdmin(ws);
     } catch {
       addLog("ERROR", "Admin WS token inválido", { ip: req.socket?.remoteAddress });
       return ws.close(1008, "invalid admin token");
@@ -602,19 +816,27 @@ wss.on("connection", (ws, req) => {
   }
 
   if (role === "agent" && deviceId) {
-    const d = upsertDevice(deviceId);
+    // Tenant do agent vem da querystring; compat: se ausente, usa DEFAULT_TENANT.
+    const tenant = resolveTenantFromAgentQuery(params);
+    if (!tenant) {
+      addLog("WARN", "Agent tenant inválido - fechando", { deviceId, tenantRaw: params.get("tenant") });
+      return ws.close(1008, "invalid tenant");
+    }
+
+    const d = upsertDevice(deviceId, tenant);
     d.connected = true;
     d.lastSeen = nowMs();
     if (agentVersion) d.agentVersion = agentVersion;
 
     ws.isAgent = true;
     ws.deviceId = deviceId;
+    ws.tenant = tenant;
 
     wsAgentsByDeviceId.set(deviceId, ws);
 
-    addLog("INFO", "Agent conectado", { deviceId, agentVersion: d.agentVersion });
+    addLog("INFO", "Agent conectado", { deviceId, tenant: d.tenant, agentVersion: d.agentVersion });
 
-    broadcastToAdmins({
+    broadcastPresence(deviceId, {
       type: "device_presence",
       deviceId,
       online: true,
@@ -624,10 +846,13 @@ wss.on("connection", (ws, req) => {
   }
 
   ws.on("message", (raw, isBinary) => {
+    // ==========================
+    // BINÁRIO (frames JPEG do agent)
+    // ==========================
     if (ws.isAgent && isBinary) {
       const id = ws.deviceId;
 
-      const d = upsertDevice(id);
+      const d = upsertDevice(id, ws.tenant);
       d.lastSeen = nowMs();
 
       const lastAt = Number(lastFrameSentAtByDevice[id] || 0);
@@ -639,12 +864,16 @@ wss.on("connection", (ws, req) => {
 
       addLog("INFO", "frame_received_binary", {
         deviceId: id,
+        tenant: d.tenant,
         bytes: raw?.length || 0,
       });
 
       return;
     }
 
+    // ==========================
+    // JSON (mensagens de controle)
+    // ==========================
     let msg;
     try {
       msg = JSON.parse(raw.toString());
@@ -660,17 +889,36 @@ wss.on("connection", (ws, req) => {
       type: msg?.type || null,
     });
 
+    // Heartbeat
     if (msg?.type === "ping") {
       if (ws.isAgent && ws.deviceId) {
-        const d = upsertDevice(ws.deviceId);
+        const d = upsertDevice(ws.deviceId, ws.tenant);
         d.lastSeen = nowMs();
       }
       safeSend(ws, { type: "pong" });
       return;
     }
 
+    // Admin pedindo suporte: só pode solicitar para device do tenant permitido.
     if (ws.isAdmin && msg?.type === "request_remote_access") {
       const targetId = normDeviceId(msg.deviceId);
+
+      const allowedTenants = ws.allowedTenants || [];
+      if (!adminCanAccessDevice(allowedTenants, targetId)) {
+        addLog("WARN", "request_remote_access denied (tenant isolation)", {
+          admin: ws.adminUser,
+          deviceId: targetId,
+        });
+
+        safeSend(ws, {
+          type: "consent_response",
+          deviceId: targetId,
+          accepted: false,
+          reason: "forbidden",
+        });
+        return;
+      }
+
       const agentWs = wsAgentsByDeviceId.get(targetId);
 
       addLog("INFO", "request_remote_access", {
@@ -694,16 +942,20 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
+    // Resposta de consentimento do agent: broadcast filtrado por tenant do device.
     if (ws.isAgent && msg?.type === "consent_response") {
       const id = ws.deviceId;
       const accepted = !!msg.accepted;
 
-      addLog("INFO", "consent_response", { deviceId: id, accepted });
+      const d = upsertDevice(id, ws.tenant);
 
-      broadcastToAdmins({ type: "consent_response", deviceId: id, accepted });
+      addLog("INFO", "consent_response", { deviceId: id, tenant: d.tenant, accepted });
+
+      broadcastToAdminsFiltered({ type: "consent_response", deviceId: id, accepted }, d.tenant);
       return;
     }
 
+    // Compat JSON-frame antigo
     if (ws.isAgent && (msg?.type === "frame" || msg?.type === "screen_frame")) {
       const id = ws.deviceId;
 
@@ -711,12 +963,12 @@ wss.on("connection", (ws, req) => {
         typeof msg.jpegBase64 === "string"
           ? msg.jpegBase64
           : typeof msg.jpeg === "string"
-          ? msg.jpeg
-          : "";
+            ? msg.jpeg
+            : "";
 
       if (!payload) return;
 
-      const d = upsertDevice(id);
+      const d = upsertDevice(id, ws.tenant);
       d.lastSeen = nowMs();
 
       const lastAt = Number(lastFrameSentAtByDevice[id] || 0);
@@ -728,6 +980,7 @@ wss.on("connection", (ws, req) => {
 
       addLog("INFO", "frame_received_json", {
         deviceId: id,
+        tenant: d.tenant,
         len: payload.length,
         isDataUrl: payload.startsWith("data:"),
       });
@@ -752,11 +1005,12 @@ wss.on("connection", (ws, req) => {
       wsAgentsByDeviceId.delete(ws.deviceId);
       mjpegViewersByDevice[ws.deviceId] = 0;
 
-      broadcastToAdmins({
+      broadcastPresence(ws.deviceId, {
         type: "device_presence",
         deviceId: ws.deviceId,
         online: false,
         lastSeen: nowMs(),
+        agentVersion: d?.agentVersion ?? null,
       });
     }
   });
@@ -775,5 +1029,9 @@ wss.on("connection", (ws, req) => {
 // Start
 // ============================
 server.listen(PORT, "0.0.0.0", () => {
-  addLog("INFO", "Backend rodando", { port: PORT });
+  addLog("INFO", "Backend rodando", {
+    port: PORT,
+    defaultTenant: DEFAULT_TENANT,
+    validTenants: Array.from(VALID_TENANTS),
+  });
 });

@@ -14,12 +14,18 @@
     "dist": "electron-builder",
     "dist:win": "electron-builder --win",
     "dist:linux": "electron-builder --linux",
-    "dist:mac": "electron-builder --mac"
+    "dist:mac": "electron-builder --mac",
+    "dist:win:cla1": "cross-env LOOKOUT_TENANT=CLA1 electron-builder --win",
+    "dist:win:cla2": "cross-env LOOKOUT_TENANT=CLA2 electron-builder --win",
+    "dist:win:dla1": "cross-env LOOKOUT_TENANT=DLA1 electron-builder --win",
+    "dist:win:dla2": "cross-env LOOKOUT_TENANT=DLA2 electron-builder --win",
+    "dist:win:all": "npm run dist:win:cla1 && npm run dist:win:cla2 && npm run dist:win:dla1 && npm run dist:win:dla2"
   },
   "dependencies": {
     "ws": "^8.16.0"
   },
   "devDependencies": {
+    "cross-env": "^7.0.3",
     "electron": "^28.2.0",
     "electron-builder": "^24.13.3"
   },
@@ -27,6 +33,7 @@
     "appId": "com.lookout.agent",
     "productName": "Lookout Agent",
     "asar": true,
+    "artifactName": "Lookout Agent ${env.LOOKOUT_TENANT} Setup ${version}.${ext}",
     "directories": {
       "output": "dist"
     },
